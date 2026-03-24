@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from demo.config import GENERATED_PREFIX
+
+
+def parse_jacoco_xml(xml_path: Path) -> Dict[str, float]:
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(str(xml_path))
+    root = tree.getroot()
+
+    def pct(covered: int, missed: int) -> float:
+        denom = covered + missed
+        return (covered / denom) if denom else 0.0
+
+    counters = {}
+    for c in root.findall("counter"):
+        typ = c.attrib.get("type")
+        covered = int(c.attrib.get("covered", "0"))
+        missed = int(c.attrib.get("missed", "0"))
+        counters[typ] = (covered, missed)
+
+    line_cov = pct(*counters.get("LINE", (0, 0)))
+    instr_cov = pct(*counters.get("INSTRUCTION", (0, 0)))
+    branch_cov = pct(*counters.get("BRANCH", (0, 0)))
+    return {
+        "line_coverage": line_cov,
+        "instruction_coverage": instr_cov,
+        "branch_coverage": branch_cov,
+    }
+
+
+def parse_surefire_summary(log: str) -> Optional[Dict[str, int]]:
+    m = re.search(
+        r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)",
+        log,
+    )
+    if not m:
+        return None
+    return {
+        "tests_run": int(m.group(1)),
+        "failures": int(m.group(2)),
+        "errors": int(m.group(3)),
+        "skipped": int(m.group(4)),
+    }
+
+
+def parse_surefire_reports(reports_dir: Path) -> Optional[Dict[str, int]]:
+    if not reports_dir.exists():
+        return None
+    import xml.etree.ElementTree as ET
+
+    totals = {"tests_run": 0, "failures": 0, "errors": 0, "skipped": 0}
+    any_found = False
+    for xml_path in reports_dir.glob("TEST-*.xml"):
+        try:
+            tree = ET.parse(str(xml_path))
+        except ET.ParseError:
+            continue
+        root = tree.getroot()
+        if root.tag != "testsuite":
+            continue
+        any_found = True
+        totals["tests_run"] += int(root.attrib.get("tests", "0"))
+        totals["failures"] += int(root.attrib.get("failures", "0"))
+        totals["errors"] += int(root.attrib.get("errors", "0"))
+        totals["skipped"] += int(root.attrib.get("skipped", "0"))
+    return totals if any_found else None
+
+
+def extract_runtime_failures(reports_dir: Path) -> List[Dict[str, str]]:
+    if not reports_dir.exists():
+        return []
+    import xml.etree.ElementTree as ET
+
+    failures: Dict[str, str] = {}
+    for xml_path in reports_dir.glob("TEST-*.xml"):
+        try:
+            tree = ET.parse(str(xml_path))
+        except ET.ParseError:
+            continue
+        root = tree.getroot()
+        for case in root.findall(".//testcase"):
+            classname = case.attrib.get("classname", "")
+            if GENERATED_PREFIX not in classname or not classname.endswith("Test"):
+                continue
+            failure = case.find("failure")
+            error = case.find("error")
+            node = failure if failure is not None else error
+            if node is None:
+                continue
+            text = (node.text or "").strip()
+            if classname not in failures:
+                failures[classname] = text
+    return [{"class_name": k, "stack_trace": v} for k, v in failures.items()]

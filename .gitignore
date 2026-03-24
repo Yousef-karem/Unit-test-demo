@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Demo output (cloned repos, build artifacts, local runs)
+demo_out/
+
+# Archives / local bundles
+*.zip
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Java (if any local Maven target at repo root)
+target/
