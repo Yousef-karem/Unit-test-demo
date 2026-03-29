@@ -137,6 +137,50 @@ def write_test_file(project_root: Path, target_pkg: str, test_class_name: str, c
     return path
 
 
+def isolate_non_generated_test_files(
+    project_root: Path, generated_paths: List[str], backup_root: Path
+) -> List[Dict[str, str]]:
+    """
+    Move non-generated *Test.java files out of src/test/java for this run.
+    This prevents unrelated pre-existing test compile failures from blocking
+    generated-test coverage runs.
+    """
+    test_root = project_root / "src" / "test" / "java"
+    if not test_root.exists():
+        return []
+
+    generated_set = {Path(p).resolve() for p in generated_paths}
+    moved: List[Dict[str, str]] = []
+
+    for test_file in test_root.rglob("*Test.java"):
+        try:
+            resolved = test_file.resolve()
+        except OSError:
+            resolved = test_file
+
+        # Keep generated tests in place.
+        if resolved in generated_set or test_file.name.startswith(GENERATED_PREFIX):
+            continue
+
+        rel = test_file.relative_to(test_root)
+        dest = backup_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(test_file), str(dest))
+        moved.append({"from": str(test_file), "to": str(dest)})
+
+    return moved
+
+
+def restore_isolated_test_files(moved: List[Dict[str, str]]) -> None:
+    for item in moved:
+        src = Path(item["to"])
+        dst = Path(item["from"])
+        if not src.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+
+
 # ----------------------------
 # Pipeline
 # ----------------------------
@@ -244,12 +288,25 @@ def run_pipeline(args) -> None:
     written_paths = list(generated_paths)
     (demo_root / "written_paths.json").write_text(json.dumps(written_paths, indent=2), encoding="utf-8")
 
+    # Isolate pre-existing non-generated tests so compile/runtime can focus on
+    # generated tests only.
+    isolation_root = demo_root / "isolation" / "non_generated_tests"
+    isolated_tests = isolate_non_generated_test_files(project_root, generated_paths, isolation_root)
+    if isolated_tests:
+        print(f"Isolated {len(isolated_tests)} pre-existing non-generated test files.")
+    (demo_root / "isolation").mkdir(parents=True, exist_ok=True)
+    (demo_root / "isolation" / "moved_tests.json").write_text(
+        json.dumps(isolated_tests, indent=2), encoding="utf-8"
+    )
+
     # 6) Compile repair loop: GPT repair first, then compile gate
     print("\nCompile stage: compiling ONLY generated tests:", GENERATED_PATTERN)
 
     compile_gate_log: List[Dict] = []
     repair_log: List[Dict] = []
     retry_counts: Dict[str, int] = {}
+    compile_blocked = False
+    compile_blocked_reason = ""
 
     repo_types_text = ", ".join(list_repository_types(project_root))
 
@@ -282,6 +339,10 @@ def run_pipeline(args) -> None:
 
         failing_path = extract_first_failing_test_path(last_compile_log)
         if not failing_path:
+            compile_blocked = True
+            compile_blocked_reason = (
+                "maven test-compile failed due to non-generated test compile errors"
+            )
             break
 
         # save "before repair" artifacts
@@ -413,6 +474,10 @@ def run_pipeline(args) -> None:
 
         failing_paths = extract_failing_test_paths(last_compile_log)
         if not failing_paths:
+            compile_blocked = True
+            compile_blocked_reason = (
+                "maven test-compile failed due to non-generated test compile errors"
+            )
             break
 
         for failing_path in failing_paths:
@@ -432,7 +497,7 @@ def run_pipeline(args) -> None:
     compile_rejected_files = list((demo_root / "rejected" / "compile").rglob(f"{GENERATED_PREFIX}*Test.java"))
     compile_rejected = len(compile_rejected_files)
 
-    early_stop = compile_survivors == 0
+    early_stop = (compile_survivors == 0) or compile_blocked
 
     # 7) Runtime stage: run tests with JaCoCo agent; runtime repair on failures
     test_log = ""
@@ -590,7 +655,10 @@ def run_pipeline(args) -> None:
     # No-report reason
     if not (report_dir / "index.html").exists():
         if early_stop:
-            reason = "0 generated tests compiled"
+            if compile_blocked:
+                reason = compile_blocked_reason
+            else:
+                reason = "0 generated tests compiled"
         elif not jacoco_exec_found:
             reason = "jacoco.exec not found (tests did not execute far enough)"
         else:
@@ -608,8 +676,12 @@ def run_pipeline(args) -> None:
         "generated_total": len(written_paths),
         "compile_survivors": compile_survivors,
         "compile_rejected": int(compile_rejected),
+        "compile_blocked": compile_blocked,
+        "compile_blocked_reason": compile_blocked_reason or None,
         "runtime_survivors": runtime_survivors,
         "runtime_rejected": int(runtime_rejected),
+        "isolated_non_generated_tests": len(isolated_tests),
+        "isolated_tests_manifest": str((demo_root / "isolation" / "moved_tests.json").resolve()),
         "survivor_test_files_in_repo": generated_paths,
         "rejected_compile_dir": str((demo_root / "rejected" / "compile").resolve()),
         "rejected_runtime_dir": str((demo_root / "rejected" / "runtime").resolve()),
@@ -625,6 +697,9 @@ def run_pipeline(args) -> None:
         "note": "Tests were written locally into src/test/java but NOT committed or pushed.",
     }
     (demo_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    # Restore isolated test files back into cloned repo tree.
+    restore_isolated_test_files(isolated_tests)
 
     print("\n=== DONE ===")
     print(f"Summary: {demo_root / 'summary.json'}")
