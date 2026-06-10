@@ -7,7 +7,12 @@ from demo.config import DEFAULT_GPT_MODEL, DEFAULT_OLLAMA_MODEL
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", required=True, help="GitHub URL or local project path")
+    ap.add_argument("--repo", required=False, help="GitHub URL or local project path")
+    ap.add_argument(
+        "--generate-from-prompts",
+        default=None,
+        help="Path to an existing DemoTestCases folder; reads prompts/*.json and writes generated tests with Ollama",
+    )
     ap.add_argument("--branch", default=None)
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
     ap.add_argument("--build", choices=["auto", "maven", "gradle"], default="auto")
@@ -24,6 +29,9 @@ def main() -> None:
         help="Skip classes likely to be framework wiring (default: enabled)",
     )
     args = ap.parse_args()
+    if not args.repo and not args.generate_from_prompts:
+        ap.error("--repo is required unless --generate-from-prompts is provided")
+
     from demo.pipeline import run_pipeline
 
     run_pipeline(args)

@@ -10,8 +10,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from openai import OpenAI
-
 from demo.config import (
     DEMO_OUT,
     GENERATED_PATTERN,
@@ -30,11 +28,6 @@ from demo.coverage.parse import (
     parse_jacoco_xml,
     parse_surefire_reports,
     parse_surefire_summary,
-)
-from demo.llm.gpt import (
-    gpt_repair_test,
-    gpt_runtime_repair_test,
-    gpt_write_prompt,
 )
 from demo.llm.ollama import ollama_generate
 from demo.packages import (
@@ -137,11 +130,96 @@ def write_test_file(project_root: Path, target_pkg: str, test_class_name: str, c
     return path
 
 
+def _load_saved_prompt(path: Path) -> Dict:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Prompt file is not a JSON object: {path}")
+    if not data.get("test_class_name") or not data.get("prompt"):
+        raise ValueError(f"Prompt file must contain test_class_name and prompt: {path}")
+    return data
+
+
+def run_generation_from_saved_prompts(args) -> None:
+    demo_root = Path(args.generate_from_prompts).expanduser().resolve()
+    if not demo_root.exists():
+        raise RuntimeError(f"DemoTestCases folder not found: {demo_root}")
+
+    prompts_dir = demo_root / "prompts"
+    targets_path = demo_root / "targets.json"
+    config_path = demo_root / "config.json"
+    run_root = demo_root.parent
+    project_root = run_root / "repo"
+
+    if not prompts_dir.exists():
+        raise RuntimeError(f"Prompts folder not found: {prompts_dir}")
+    if not targets_path.exists():
+        raise RuntimeError(f"targets.json not found: {targets_path}")
+    if not project_root.exists():
+        raise RuntimeError(f"Cloned repo folder not found: {project_root}")
+
+    targets: List[Dict] = json.loads(targets_path.read_text(encoding="utf-8-sig"))
+    mode = getattr(args, "mode", "method")
+    if config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        mode = config.get("args", {}).get("mode", mode)
+
+    prompt_files = sorted(prompts_dir.glob("*.json"))
+    if not prompt_files:
+        raise RuntimeError(f"No prompt JSON files found in: {prompts_dir}")
+
+    target_by_class: Dict[str, Dict] = {}
+    used_test_class_names: set[str] = set()
+    for i, t in enumerate(targets, 1):
+        expected = ensure_unique_test_class_name("", t, mode)
+        expected = ensure_unique_run_class_name(expected, used_test_class_names, i)
+        used_test_class_names.add(expected)
+        target_by_class[expected] = t
+
+    generated_paths: List[str] = []
+    test_target_map: Dict[str, Dict] = {}
+
+    for i, prompt_path in enumerate(prompt_files, 1):
+        g = _load_saved_prompt(prompt_path)
+        test_class = g["test_class_name"]
+        target = target_by_class.get(test_class)
+
+        if target is None and len(prompt_files) == len(targets):
+            target = targets[i - 1]
+
+        if target is None:
+            known = ", ".join(sorted(target_by_class))
+            raise RuntimeError(
+                f"Could not match prompt {prompt_path.name} to a target. "
+                f"Known target test classes: {known}"
+            )
+
+        print(f"[{i}/{len(prompt_files)}] Generating {test_class} from saved prompt ...")
+        code = sanitize_java_output(ollama_generate(args.ollama_model, g["prompt"]))
+
+        (demo_root / "generated").mkdir(parents=True, exist_ok=True)
+        (demo_root / "generated" / f"{test_class}.java").write_text(code, encoding="utf-8")
+
+        out_path = write_test_file(project_root, target["package"], test_class, code)
+        generated_paths.append(str(out_path))
+        test_target_map[test_class] = target
+
+    (demo_root / "written_paths.json").write_text(json.dumps(generated_paths, indent=2), encoding="utf-8")
+    (demo_root / "test_target_map.json").write_text(json.dumps(test_target_map, indent=2), encoding="utf-8")
+
+    print("\n=== GENERATED FROM SAVED PROMPTS ===")
+    print(f"Generated tests: {len(generated_paths)}")
+    print(f"Written paths: {demo_root / 'written_paths.json'}")
+
+
 # ----------------------------
 # Pipeline
 # ----------------------------
 
 def run_pipeline(args) -> None:
+    if getattr(args, "generate_from_prompts", None):
+        run_generation_from_saved_prompts(args)
+        return
+
     # 1) Per-repo run root + clone/open repo
     DEMO_OUT.mkdir(exist_ok=True)
     repo_name = repo_name_from_arg(args.repo)
@@ -205,8 +283,19 @@ def run_pipeline(args) -> None:
     }
     (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     (demo_root / "targets.json").write_text(json.dumps(targets, indent=2), encoding="utf-8")
+    print(f"Exported {len(targets)} targets")
+    print(f"Targets file: {demo_root / 'targets.json'}")
+    return
 
     # 5) GPT writes prompts; Ollama generates tests; write into repo
+    from openai import OpenAI
+
+    from demo.llm.gpt import (
+        gpt_repair_test,
+        gpt_runtime_repair_test,
+        gpt_write_prompt,
+    )
+
     load_env_file(Path(__file__).resolve().parents[1] / ".env")
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
