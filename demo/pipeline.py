@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from openai import OpenAI
+
 
 from demo.config import (
     DEMO_OUT,
@@ -31,10 +31,10 @@ from demo.coverage.parse import (
     parse_surefire_reports,
     parse_surefire_summary,
 )
-from demo.llm.gpt import (
-    gpt_repair_test,
-    gpt_runtime_repair_test,
-    gpt_write_prompt,
+from demo.llm.prompt_writer import (
+    ollama_repair_test,
+    ollama_runtime_repair_test,
+    ollama_write_prompt,
 )
 from demo.llm.ollama import ollama_generate
 from demo.packages import (
@@ -250,9 +250,8 @@ def run_pipeline(args) -> None:
     (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     (demo_root / "targets.json").write_text(json.dumps(targets, indent=2), encoding="utf-8")
 
-    # 5) GPT writes prompts; Ollama generates tests; write into repo
+    # 5) Ollama writes prompts; Ollama generates tests; write into repo
     load_env_file(Path(__file__).resolve().parents[1] / ".env")
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     generated_paths: List[str] = []
     test_target_map: Dict[str, Dict] = {}
@@ -263,7 +262,7 @@ def run_pipeline(args) -> None:
     project_types_text = ", ".join(project_types[:800])
 
     for i, t in enumerate(targets, 1):
-        g = gpt_write_prompt(client, args.gpt_model, t, project_types_text)
+        g = ollama_write_prompt(args.gpt_model, t, project_types_text)
 
         test_class = g.get("test_class_name", "")
         test_class = ensure_unique_test_class_name(test_class, t, args.mode)
@@ -390,9 +389,8 @@ def run_pipeline(args) -> None:
             except OSError:
                 pass
 
-        fixed_code = gpt_repair_test(
-            client=client,
-            gpt_model=args.gpt_model,
+        fixed_code = ollama_repair_test(
+            model=args.gpt_model,
             compiler_errors=last_compile_log,
             file_content=file_content,
             source_text=source_text,
@@ -574,9 +572,8 @@ def run_pipeline(args) -> None:
                     continue
 
                 # FIX #2: keyword call (avoids args/positional confusion)
-                fixed_code = gpt_runtime_repair_test(
-                    client=client,
-                    gpt_model=args.gpt_model,
+                fixed_code = ollama_runtime_repair_test(
+                    model=args.gpt_model,
                     stack_trace=stack_trace,
                     file_content=file_content,
                 )
