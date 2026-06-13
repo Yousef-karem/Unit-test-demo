@@ -106,6 +106,7 @@ Return ONLY valid JSON with keys:
 
 Constraints for the generated test class:
 - Output MUST be ONLY Java code (no markdown, no explanations).
+- Start directly with the Java package/import/class declarations. Never include prose before or after the class.
 - Use ONLY JUnit 5 and Mockito (no Spring test framework).
 - Do NOT use @SpringBootTest, MockMvc, WebMvcTest, SecurityMockMvcRequestPostProcessors, SpringExtension, or any Spring test utilities.
 - Do NOT use Spring test annotations (@SpringBootTest, etc.).
@@ -119,6 +120,10 @@ Constraints for the generated test class:
 - Do not invent packages or class names (e.g., Entity vs Entities).
 - If a dependency type is not in imports/snippet/allowlist, avoid that test idea and write a simpler test.
 - Create the class under test manually; mock only its dependencies.
+- Do NOT mock the class or method under test. Do NOT write tests that only assert Mockito stubs.
+- Every @Test method must execute at least one real production method from the target class or a concrete implementation of the target interface.
+- If the target type is an interface or abstract type, test a real concrete implementation from the allowlist/source context when available; otherwise do not use a mocked interface as the subject under test.
+- Prefer simple real objects and constructors from the source code over Mockito. Use exact constructor signatures.
 - Use these imports exactly; do not use javax.* if project uses jakarta.*; do not invent missing dependencies.
 - Never use raw Object in Mockito stubbing; always return the exact declared return type.
 - Prefer real values for enums (e.g., Role.ADMIN) rather than mocks.
@@ -127,6 +132,12 @@ Constraints for the generated test class:
 - {class_mode_note}
 - At least 3 @Test methods with concrete assertions.
 - Name the test class exactly as you output in test_class_name.
+- The Java code inside the "prompt" field MUST declare: public class <test_class_name> using the exact test_class_name value from this JSON.
+- Only call methods and access fields that appear in the source snippet, related type sources, or allowlist. Do not invent getters/setters (e.g. getKey()) unless they exist in the provided source.
+- For concrete classes, prefer constructing real instances (using constructors from the source) instead of mocking domain types.
+- When a method parameter is an interface and a concrete implementation exists in the allowlist (e.g. Item -> MyItem), pass real instances like `new MyItem(5)` — never mock interface methods with Mockito.
+- Access public fields directly when no getter exists (e.g. `item.key`, not `item.getKey()`).
+- Cover all branches: equal, less-than, and greater-than paths where the source has conditionals.
 - Place it in package: "{pkg}" if not default.
 
 Target:
@@ -155,6 +166,7 @@ def ollama_repair_test(
     package_imports: str,
     constructor_info: str,
     repository_types: str,
+    related_type_sources: str = "",
 ) -> str:
     sys = (
         "You are a senior Java testing expert. "
@@ -179,7 +191,14 @@ Constructor signature info:
 Repository-like types in project:
 {repository_types}
 
+Related type sources (only use APIs shown here):
+{related_type_sources or "(none)"}
+
 Instruction: Return corrected Java test file ONLY, keep class name and package, fix typing/import issues, don’t introduce new libraries.
+Only call methods and access fields that exist in the related type sources or class under test source. Replace invented methods (e.g. getKey()) with real constructors/fields/APIs from the source.
+Start directly with package/import/class declarations. Do not include markdown fences, headings, bullet lists, or explanations.
+Keep or add JUnit 5 imports for every annotation/assertion used.
+Do not mock the class or method under test. Each test must call real production code; replace mock-only assertions with real object calls when constructors/source context allow it.
 Do not invent dependency types. If a referenced type (e.g., UserRepository) does not exist in the project, replace it with the closest matching real type from the repository list or remove that dependency and adjust the test accordingly.
 """.strip()
 
