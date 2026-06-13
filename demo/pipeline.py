@@ -626,7 +626,14 @@ def run_pipeline(args) -> None:
     html_path = html if html.exists() else None
 
     jacoco_exec_found = (project_root / "target" / "jacoco.exec").exists()
+    zero_coverage = {
+        "line_coverage": 0.0,
+        "instruction_coverage": 0.0,
+        "branch_coverage": 0.0,
+    }
     coverage: Dict[str, float] = parse_jacoco_xml(xml_path) if xml_path else {}
+    if early_stop:
+        coverage = zero_coverage
 
     # Copy report into demo_out
     report_dir = demo_root / "coverage" / "report"
