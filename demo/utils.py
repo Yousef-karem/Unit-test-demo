@@ -257,6 +257,33 @@ def enforce_test_class_name(code: str, expected_class_name: str) -> str:
     )
 
 
+def ensure_junit5_imports(code: str) -> str:
+    if not code.strip():
+        return code
+
+    required: List[str] = []
+    if "@Test" in code and "import org.junit.jupiter.api.Test;" not in code:
+        required.append("import org.junit.jupiter.api.Test;")
+    if "@BeforeEach" in code and "import org.junit.jupiter.api.BeforeEach;" not in code:
+        required.append("import org.junit.jupiter.api.BeforeEach;")
+    if "@AfterEach" in code and "import org.junit.jupiter.api.AfterEach;" not in code:
+        required.append("import org.junit.jupiter.api.AfterEach;")
+    if not required:
+        return code
+
+    lines = code.splitlines()
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith("package "):
+            insert_at = i + 1
+        elif line.strip().startswith("import "):
+            insert_at = i + 1
+
+    prefix_blank = insert_at > 0 and insert_at < len(lines) and lines[insert_at].strip()
+    to_insert = required + ([""] if prefix_blank else [])
+    return "\n".join(lines[:insert_at] + to_insert + lines[insert_at:])
+
+
 def validate_java_test_output(code: str, expected_class_name: Optional[str] = None) -> Optional[str]:
     cleaned = (code or "").strip()
     if not cleaned:

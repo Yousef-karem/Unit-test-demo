@@ -85,7 +85,24 @@ def ollama_write_prompt(model: str, target: Dict, project_types_text: str) -> Di
     pkg = target["package"] or "(default)"
     cls = target["class_name"]
     sig = target["signature"] or f"(entire class) {cls}"
-    imports_context = extract_imports_context(target)
+    imports_context = (
+        target.get("package_line") or "Imports unavailable from AST analyzer; use allowlist only."
+        if target.get("analysis_source") == "ast"
+        else extract_imports_context(target)
+    )
+    test_libraries = target.get("test_libraries") or {}
+    has_mockito = bool(test_libraries.get("mockito", True))
+    framework_rule = (
+        "Use ONLY JUnit 5 and Mockito (no Spring test framework). Mock only real external dependencies when needed."
+        if has_mockito
+        else "Use ONLY JUnit 5. Mockito is NOT available in this project: do not import org.mockito, do not use @Mock/@InjectMocks/when/verify/MockitoAnnotations, and do not invent implementation classes."
+    )
+    dependency_rule = (
+        "Create the class under test manually; mock only its dependencies."
+        if has_mockito
+        else "Create or call the class under test directly using real constructors/static methods and simple values."
+    )
+    allowed_test_tools = "JDK/JUnit/Mockito" if has_mockito else "JDK/JUnit"
 
     class_mode_note = ""
     if target.get("method_name") is None:
@@ -107,19 +124,19 @@ Return ONLY valid JSON with keys:
 Constraints for the generated test class:
 - Output MUST be ONLY Java code (no markdown, no explanations).
 - Start directly with the Java package/import/class declarations. Never include prose before or after the class.
-- Use ONLY JUnit 5 and Mockito (no Spring test framework).
+- {framework_rule}
 - Do NOT use @SpringBootTest, MockMvc, WebMvcTest, SecurityMockMvcRequestPostProcessors, SpringExtension, or any Spring test utilities.
 - Do NOT use Spring test annotations (@SpringBootTest, etc.).
 - Do NOT use any libraries beyond JUnit 5 + Mockito.
-- Only use types that appear in the provided snippet/imports (plus JDK/JUnit/Mockito).
+- Only use types that appear in the provided snippet/imports (plus {allowed_test_tools}).
 - Do not use Spring/Spring Security test utilities or types unless they already appear in the imports.
-- Use ONLY types already imported by the target class, plus JDK/JUnit/Mockito. Do not introduce new application types (repositories/entities) unless they appear in the target source or imports.
+- Use ONLY types already imported by the target class, plus {allowed_test_tools}. Do not introduce new application types (repositories/entities) unless they appear in the target source or imports.
 - Do NOT reference services/repositories unless they are imported in the target source OR appear in the snippet.
 - If the target is a Controller class and service types are not imported, do NOT create mocks for them; test only pure logic.
 - You may ONLY reference application types whose SIMPLE class name appears in the allowlist below.
 - Do not invent packages or class names (e.g., Entity vs Entities).
 - If a dependency type is not in imports/snippet/allowlist, avoid that test idea and write a simpler test.
-- Create the class under test manually; mock only its dependencies.
+- {dependency_rule}
 - Do NOT mock the class or method under test. Do NOT write tests that only assert Mockito stubs.
 - Every @Test method must execute at least one real production method from the target class or a concrete implementation of the target interface.
 - If the target type is an interface or abstract type, test a real concrete implementation from the allowlist/source context when available; otherwise do not use a mocked interface as the subject under test.
@@ -170,7 +187,7 @@ def ollama_repair_test(
 ) -> str:
     sys = (
         "You are a senior Java testing expert. "
-        "You fix compilation errors in JUnit5 + Mockito tests."
+        "You fix compilation errors in JUnit5 tests."
     )
     user = f"""
 Compiler errors:
@@ -195,6 +212,7 @@ Related type sources (only use APIs shown here):
 {related_type_sources or "(none)"}
 
 Instruction: Return corrected Java test file ONLY, keep class name and package, fix typing/import issues, don’t introduce new libraries.
+If compiler errors say org.mockito does not exist, remove every Mockito import/annotation/call and rewrite the test as plain JUnit 5 using real objects or static method calls.
 Only call methods and access fields that exist in the related type sources or class under test source. Replace invented methods (e.g. getKey()) with real constructors/fields/APIs from the source.
 Start directly with package/import/class declarations. Do not include markdown fences, headings, bullet lists, or explanations.
 Keep or add JUnit 5 imports for every annotation/assertion used.
