@@ -11,6 +11,22 @@ def main() -> None:
     ap.add_argument("--branch", default=None)
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
     ap.add_argument("--build", choices=["auto", "maven", "gradle"], default="auto")
+    ap.add_argument(
+        "--analysis-mode",
+        choices=["ast", "source"],
+        default="ast",
+        help="Use static analyzer AST JSON for targets/context, or legacy source regex extraction",
+    )
+    ap.add_argument(
+        "--analyzer-jar",
+        default=None,
+        help="Path to testnexus-analyzer fat JAR; defaults to ./testnexus-analyzer-1.0.0.jar",
+    )
+    ap.add_argument(
+        "--analysis-classpath",
+        default=None,
+        help="Optional classpath for AST symbol solving; if omitted, common target/build/lib jars are inferred",
+    )
     ap.add_argument("--packages", default=None, help='Comma-separated packages, or "ALL" (default). Example: com.app.service,com.app.util')
     ap.add_argument("--select-packages", action="store_true", help="Interactive multi-select packages")
     ap.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL)

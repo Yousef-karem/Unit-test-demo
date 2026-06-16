@@ -20,6 +20,7 @@ from demo.config import (
 from demo.coverage.maven import (
     extract_failing_test_paths,
     extract_first_failing_test_path,
+    maven_executable,
     run_maven_report,
     run_maven_tests,
     strip_ansi,
@@ -44,9 +45,16 @@ from demo.packages import (
     list_java_files,
 )
 from demo.repo import clone_or_update, detect_build_system
+from demo.static_analysis import (
+    project_type_context_from_analysis,
+    related_type_sources_from_analysis,
+    run_ast_analysis,
+    targets_from_analysis,
+)
 from demo.targets import _extract_imports_context_from_text, extract_targets
 from demo.utils import (
     ensure_unique_run_class_name,
+    ensure_junit5_imports,
     enforce_test_class_name,
     find_concrete_impls,
     load_env_file,
@@ -219,6 +227,23 @@ def list_repository_types(project_root: Path) -> List[str]:
     return sorted(names)
 
 
+def project_has_mockito(project_root: Path) -> bool:
+    candidates = [
+        project_root / "pom.xml",
+        project_root / "build.gradle",
+        project_root / "build.gradle.kts",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            if "mockito" in path.read_text(encoding="utf-8", errors="ignore").lower():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def extract_constructor_info(source_text: str, class_name: str) -> str:
     if not source_text or not class_name:
         return ""
@@ -338,37 +363,67 @@ def run_pipeline(args) -> None:
         selected = [p.strip() for p in args.packages.split(",") if p.strip()] or ["*"]
 
     # 4) Collect targets
-    java_files = list_java_files(project_root)
-    java_files = [f for f in java_files if file_in_selected_packages(f, project_root, selected)]
+    analysis_mode = getattr(args, "analysis_mode", "ast")
+    ast_analysis: Dict | None = None
+    if analysis_mode == "ast":
+        analysis_path = demo_root / "analysis.json"
+        analyzer_jar = Path(args.analyzer_jar) if getattr(args, "analyzer_jar", None) else None
+        ast_analysis = run_ast_analysis(
+            project_root=project_root,
+            output_path=analysis_path,
+            analyzer_jar=analyzer_jar,
+            classpath=getattr(args, "analysis_classpath", None),
+        )
+        targets = targets_from_analysis(
+            analysis=ast_analysis,
+            project_root=project_root,
+            mode=args.mode,
+            selected_packages=selected,
+            max_files=args.max_files,
+            max_targets=args.max_targets,
+            skip_framework_classes=args.skip_framework_classes,
+        )
+    else:
+        java_files = list_java_files(project_root)
+        java_files = [f for f in java_files if file_in_selected_packages(f, project_root, selected)]
 
-    targets: List[Dict] = []
-    skip_keywords = ("application", "config", "filter", "security", "interceptor")
-    scanned_files = 0
-    for f in java_files:
-        scanned_files += 1
-        for t in extract_targets(f, args.mode):
-            if args.skip_framework_classes:
-                cls_name = (t.get("class_name") or "").lower()
-                if any(k in cls_name for k in skip_keywords):
+        targets: List[Dict] = []
+        skip_keywords = ("application", "config", "filter", "security", "interceptor")
+        scanned_files = 0
+        for f in java_files:
+            scanned_files += 1
+            for t in extract_targets(f, args.mode):
+                if args.skip_framework_classes:
+                    cls_name = (t.get("class_name") or "").lower()
+                    if any(k in cls_name for k in skip_keywords):
+                        continue
+                if is_interface_target(t):
                     continue
-            if is_interface_target(t):
-                continue
-            targets.append(t)
+                targets.append(t)
+                if len(targets) >= args.max_targets:
+                    break
             if len(targets) >= args.max_targets:
                 break
-        if len(targets) >= args.max_targets:
-            break
-        if scanned_files >= args.max_files and targets:
-            break
+            if scanned_files >= args.max_files and targets:
+                break
 
     if not targets:
         raise RuntimeError("No targets found (check src/main/java and selected packages).")
+
+    has_mockito = project_has_mockito(project_root)
+    for t in targets:
+        t["test_libraries"] = {
+            "junit5": True,
+            "mockito": has_mockito,
+        }
 
     # Save config and target list for reproducibility
     config = {
         "args": vars(args),
         "selected_packages": selected,
         "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
+        "analysis_mode": analysis_mode,
+        "test_libraries": {"junit5": True, "mockito": has_mockito},
     }
     (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     (demo_root / "targets.json").write_text(json.dumps(targets, indent=2), encoding="utf-8")
@@ -381,7 +436,11 @@ def run_pipeline(args) -> None:
     used_test_class_names: set[str] = set()
 
     project_types = list_project_types(project_root)
-    project_type_context = list_project_type_context(project_root)
+    project_type_context = (
+        project_type_context_from_analysis(ast_analysis)
+        if ast_analysis is not None
+        else list_project_type_context(project_root)
+    )
     # Keep the context bounded (avoid huge prompts)
     project_types_text = "\n".join(project_type_context[:800]) or ", ".join(project_types[:800])
     generation_quality_log: List[Dict] = []
@@ -402,7 +461,11 @@ def run_pipeline(args) -> None:
         )
 
         print(f"[{i}/{len(targets)}] Generating {test_class} ...")
-        related_sources = collect_related_type_sources(project_root, t)
+        related_sources = (
+            related_type_sources_from_analysis(ast_analysis, t)
+            if ast_analysis is not None
+            else collect_related_type_sources(project_root, t)
+        )
         base_prompt = g["prompt"]
         if related_sources:
             impl_hints: List[str] = []
@@ -428,6 +491,7 @@ def run_pipeline(args) -> None:
         for attempt in range(3):
             code = sanitize_java_output(ollama_generate(args.ollama_model, prompt_text))
             code = enforce_test_class_name(code, test_class)
+            code = ensure_junit5_imports(code)
             code = remove_invented_api_stubs(code, source_bundle)
             code = rewrite_interface_mocks_to_concrete(code, related_sources)
             invalid_reason = (
@@ -435,6 +499,9 @@ def run_pipeline(args) -> None:
                 or validate_test_coverage_quality(code, t, related_sources)
                 or ""
             )
+            if not invalid_reason and not (t.get("test_libraries") or {}).get("mockito", True):
+                if re.search(r"\borg\.mockito\b|@Mock\b|@InjectMocks\b|\bMockito\b|\bwhen\s*\(", code):
+                    invalid_reason = "project has no Mockito dependency; rewrite as plain JUnit 5 with no Mockito"
             if not invalid_reason:
                 break
             prompt_text = (
@@ -514,7 +581,7 @@ def run_pipeline(args) -> None:
     print("Running Maven with RAT, Checkstyle, and Enforcer skipped for coverage-only execution.")
     for _ in range(10):
         cmd = [
-            "mvn",
+            maven_executable(),
             "-Drat.skip=true",
             "-Dcheckstyle.skip=true",
             "-Denforcer.skip=true",
@@ -587,7 +654,11 @@ def run_pipeline(args) -> None:
             except OSError:
                 pass
 
-        related_sources = collect_related_type_sources(project_root, target)
+        related_sources = (
+            related_type_sources_from_analysis(ast_analysis, target)
+            if ast_analysis is not None
+            else collect_related_type_sources(project_root, target)
+        )
         source_bundle = f"{related_sources}\n{source_text}"
         stub_fixed = remove_invented_api_stubs(file_content, source_bundle)
         stub_fixed = rewrite_interface_mocks_to_concrete(stub_fixed, related_sources)
@@ -614,6 +685,7 @@ def run_pipeline(args) -> None:
         )
 
         fixed_code = enforce_test_class_name(fixed_code, test_class)
+        fixed_code = ensure_junit5_imports(fixed_code)
         fixed_code = remove_invented_api_stubs(fixed_code, source_bundle)
         fixed_code = rewrite_interface_mocks_to_concrete(fixed_code, related_sources)
 
@@ -651,7 +723,7 @@ def run_pipeline(args) -> None:
     # --- Phase B: Compile gate loop (move remaining failing tests) ---
     for _ in range(10):
         cmd = [
-            "mvn",
+            maven_executable(),
             "-Drat.skip=true",
             "-Dcheckstyle.skip=true",
             "-Denforcer.skip=true",
