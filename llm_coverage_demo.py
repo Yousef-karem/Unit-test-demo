@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import argparse
 
-from demo.config import DEFAULT_GPT_MODEL, DEFAULT_OLLAMA_MODEL
+from demo.config import (
+    DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
+    DEFAULT_DOCKER_MAVEN_IMAGE,
+    DEFAULT_GPT_MODEL,
+    DEFAULT_OLLAMA_MODEL,
+)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", required=True, help="GitHub URL or local project path")
+    ap.add_argument("--repo", default=None, help="GitHub URL or local project path")
+    ap.add_argument(
+        "--from-run",
+        default=None,
+        help="Re-run JaCoCo coverage for an existing run without regenerating tests "
+        "(example: demo_out/09Ordenacao/runs/20260617_071517)",
+    )
     ap.add_argument("--branch", default=None)
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
     ap.add_argument("--build", choices=["auto", "maven", "gradle"], default="auto")
@@ -39,7 +50,31 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         help="Skip classes likely to be framework wiring (default: enabled)",
     )
+    ap.add_argument(
+        "--docker-maven",
+        action="store_true",
+        help="Run Maven compile/test/coverage inside a Docker container (pinned JDK/Maven)",
+    )
+    ap.add_argument(
+        "--docker-maven-image",
+        default=DEFAULT_DOCKER_MAVEN_IMAGE,
+        help="Override Docker image for Maven (default: maven:3.9-eclipse-temurin-<java-version>)",
+    )
+    ap.add_argument(
+        "--docker-maven-cache-volume",
+        default=DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
+        help="Named Docker volume for Maven .m2 cache (default: llm-coverage-maven-cache)",
+    )
     args = ap.parse_args()
+    if args.from_run:
+        if args.repo:
+            ap.error("Use either --from-run or --repo, not both.")
+        from demo.coverage_rerun import run_coverage_from_run
+
+        run_coverage_from_run(args)
+        return
+    if not args.repo:
+        ap.error("--repo is required unless --from-run is provided.")
     from demo.pipeline import run_pipeline
 
     run_pipeline(args)
