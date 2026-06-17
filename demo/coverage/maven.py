@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from demo.config import GENERATED_PATTERN
+from demo.coverage.java_version import normalize_java_version
+from demo.coverage.runner import get_maven_runner_config, run_maven
 
 
 def maven_executable() -> str:
@@ -19,52 +20,65 @@ def maven_executable() -> str:
     return "mvn"
 
 
-def project_has_jacoco(project_root: Path) -> bool:
-    return "<artifactId>jacoco-maven-plugin</artifactId>" in (project_root / "pom.xml").read_text()
+def maven_compiler_property_args(version: str) -> List[str]:
+    normalized = normalize_java_version(version)
+    try:
+        major = int(normalized)
+    except ValueError:
+        major = 8
+    if major >= 9:
+        return [f"-Dmaven.compiler.release={normalized}"]
+    return [
+        f"-Dmaven.compiler.source={normalized}",
+        f"-Dmaven.compiler.target={normalized}",
+    ]
 
 
-def run_maven_tests(project_root: Path) -> Tuple[str, int]:
-    if project_has_jacoco(project_root):
-        cmd = [
-            maven_executable(),
-            "-Drat.skip=true",
-            "-Dcheckstyle.skip=true",
-            "-Denforcer.skip=true",
-            "-q",
-            "-Dstyle.color=never",
-            f"-Dtest={GENERATED_PATTERN}",
-            "test",
-        ]
-    else:
-        cmd = [
-            maven_executable(),
-            "-Drat.skip=true",
-            "-Dcheckstyle.skip=true",
-            "-Denforcer.skip=true",
-            "-q",
-            "-Dstyle.color=never",
-            "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
-            f"-Dtest={GENERATED_PATTERN}",
-            "test",
-        ]
-    p = subprocess.run(cmd, cwd=str(project_root), text=True, capture_output=True)
-    log = (p.stdout or "") + "\n" + (p.stderr or "")
-    return log, p.returncode
-
-
-def run_maven_report(project_root: Path) -> Tuple[str, int]:
-    cmd = [
-        maven_executable(),
+def _maven_base_args() -> List[str]:
+    args = [
         "-Drat.skip=true",
         "-Dcheckstyle.skip=true",
         "-Denforcer.skip=true",
         "-q",
         "-Dstyle.color=never",
-        "org.jacoco:jacoco-maven-plugin:report",
     ]
-    p = subprocess.run(cmd, cwd=str(project_root), text=True, capture_output=True)
-    log = (p.stdout or "") + "\n" + (p.stderr or "")
-    return log, p.returncode
+    cfg = get_maven_runner_config()
+    if cfg.compiler_java_version:
+        args.extend(maven_compiler_property_args(cfg.compiler_java_version))
+    return args
+
+
+def _generated_test_surefire_args() -> List[str]:
+    return [
+        f"-Dtest={GENERATED_PATTERN}",
+        f"-Dsurefire.includes=**/{GENERATED_PATTERN}.java",
+    ]
+
+
+def project_has_jacoco(project_root: Path) -> bool:
+    return "<artifactId>jacoco-maven-plugin</artifactId>" in (project_root / "pom.xml").read_text()
+
+
+def run_maven_test_compile(project_root: Path) -> Tuple[str, int]:
+    cmd = _maven_base_args() + _generated_test_surefire_args() + ["test-compile"]
+    return run_maven(cmd, project_root)
+
+
+def run_maven_tests(project_root: Path) -> Tuple[str, int]:
+    if project_has_jacoco(project_root):
+        cmd = _maven_base_args() + _generated_test_surefire_args() + ["test"]
+    else:
+        cmd = _maven_base_args() + [
+            "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
+            *_generated_test_surefire_args(),
+            "test",
+        ]
+    return run_maven(cmd, project_root)
+
+
+def run_maven_report(project_root: Path) -> Tuple[str, int]:
+    cmd = _maven_base_args() + ["org.jacoco:jacoco-maven-plugin:report"]
+    return run_maven(cmd, project_root)
 
 
 def strip_ansi(s: str) -> str:
@@ -74,7 +88,6 @@ def strip_ansi(s: str) -> str:
 def _path_from_maven_log(raw_path: str) -> Path:
     path = raw_path.strip().replace("/", "\\") if sys.platform == "win32" else raw_path.strip()
     if sys.platform == "win32":
-        # Maven on Windows can report /C:/... or \C:\... depending on shell/tooling.
         path = re.sub(r"^[\\/]+([A-Za-z]:\\)", r"\1", path)
     return Path(path)
 
@@ -122,7 +135,6 @@ def write_failure_artifacts(failing_path: Path, errors: str, failures_dir: Path,
     try:
         shutil.copyfile(failing_path, java_out)
     except (FileNotFoundError, OSError):
-        # still write errors
         pass
     lines = strip_ansi(errors).splitlines()
     snippet = "\n".join(lines[-80:]) if lines else errors

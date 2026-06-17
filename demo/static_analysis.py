@@ -153,6 +153,8 @@ def targets_from_analysis(
                     method_info=method_info,
                     source_file=source_file,
                 )
+                if target is None:
+                    continue
                 targets.append(target)
                 if len(targets) >= max_targets:
                     return targets
@@ -176,15 +178,22 @@ def target_from_method(
     signature: str,
     method_info: Dict,
     source_file: str,
-) -> Dict:
+) -> Dict | None:
     package, class_name = split_fqcn(fqcn)
+    modifiers = (method_info.get("ast") or {}).get("modifiers") or []
+    if "private" in modifiers:
+        return None
+
     params = method_info.get("parameters") or []
     param_text = ", ".join(
         f"{p.get('type', 'Object')} {p.get('name', 'arg')}" for p in params
     )
     method_name = method_info.get("name") or signature.split("(", 1)[0]
     return_type = method_info.get("returnType") or "void"
-    java_signature = f"public {return_type} {method_name}({param_text})"
+    modifier_prefix = " ".join(m for m in ("public", "protected", "static") if m in modifiers).strip()
+    if not modifier_prefix:
+        modifier_prefix = "public"
+    java_signature = f"{modifier_prefix} {return_type} {method_name}({param_text})".strip()
     ast = method_info.get("ast") or {}
     return {
         "package": package,

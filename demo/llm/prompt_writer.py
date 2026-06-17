@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import requests
-from typing import Dict
+from typing import Dict, Tuple
 
 from demo.config import OLLAMA_URL, GENERATED_PREFIX
+from demo.coverage.java_version import java_version_guidance
 from demo.targets import extract_imports_context
 from demo.utils import sanitize_java_output
 
@@ -81,7 +82,43 @@ def ollama_generate_text(model: str, prompt: str, system: str | None = None) -> 
     return (r.json().get("response") or "").strip()
 
 
-def ollama_write_prompt(model: str, target: Dict, project_types_text: str) -> Dict:
+def _junit_prompt_rules(junit_version: str, has_mockito: bool) -> Tuple[str, str, str, str, str, str]:
+    junit_label = f"JUnit {junit_version}"
+    if junit_version == "4":
+        junit_imports = (
+            "Use org.junit.Test, org.junit.Before, org.junit.After, and static org.junit.Assert.*. "
+            "Do NOT use org.junit.jupiter.*, @BeforeEach, or @AfterEach."
+        )
+        junit_visibility = "Test methods should be public void testName()."
+        junit_forbidden = "Do NOT import or use org.junit.jupiter.api.*."
+    else:
+        junit_imports = (
+            "Use org.junit.jupiter.api.Test, Assertions, @BeforeEach, and @AfterEach. "
+            "Do NOT use org.junit.Test or org.junit.Assert."
+        )
+        junit_visibility = "Test methods may be package-private void testName()."
+        junit_forbidden = "Do NOT import org.junit.Test or static org.junit.Assert.*."
+
+    if has_mockito:
+        framework_rule = (
+            f"Use ONLY {junit_label} and Mockito (no Spring test framework). "
+            "Mock only real external dependencies when needed."
+        )
+        allowed_test_tools = "JDK/JUnit/Mockito"
+        library_limit = f"Do NOT use any libraries beyond {junit_label} + Mockito."
+    else:
+        framework_rule = (
+            f"Use ONLY {junit_label}. Mockito is NOT available in this project: "
+            "do not import org.mockito, do not use @Mock/@InjectMocks/when/verify/MockitoAnnotations, "
+            "and do not invent implementation classes."
+        )
+        allowed_test_tools = "JDK/JUnit"
+        library_limit = f"Do NOT use any libraries beyond {junit_label}."
+
+    return framework_rule, allowed_test_tools, library_limit, junit_imports, junit_visibility, junit_forbidden
+
+
+def ollama_write_prompt(model: str, target: Dict, project_types_text: str, java_version: str) -> Dict:
     pkg = target["package"] or "(default)"
     cls = target["class_name"]
     sig = target["signature"] or f"(entire class) {cls}"
@@ -91,18 +128,21 @@ def ollama_write_prompt(model: str, target: Dict, project_types_text: str) -> Di
         else extract_imports_context(target)
     )
     test_libraries = target.get("test_libraries") or {}
+    junit_version = str(test_libraries.get("junit", "5"))
     has_mockito = bool(test_libraries.get("mockito", True))
-    framework_rule = (
-        "Use ONLY JUnit 5 and Mockito (no Spring test framework). Mock only real external dependencies when needed."
-        if has_mockito
-        else "Use ONLY JUnit 5. Mockito is NOT available in this project: do not import org.mockito, do not use @Mock/@InjectMocks/when/verify/MockitoAnnotations, and do not invent implementation classes."
-    )
+    (
+        framework_rule,
+        allowed_test_tools,
+        library_limit,
+        junit_imports,
+        junit_visibility,
+        junit_forbidden,
+    ) = _junit_prompt_rules(junit_version, has_mockito)
     dependency_rule = (
         "Create the class under test manually; mock only its dependencies."
         if has_mockito
         else "Create or call the class under test directly using real constructors/static methods and simple values."
     )
-    allowed_test_tools = "JDK/JUnit/Mockito" if has_mockito else "JDK/JUnit"
 
     class_mode_note = ""
     if target.get("method_name") is None:
@@ -114,7 +154,7 @@ def ollama_write_prompt(model: str, target: Dict, project_types_text: str) -> Di
 
     sys = (
         "You are a senior Java testing expert. "
-        "You write STRICT prompts for a code-generation model to produce JUnit5 unit tests."
+        f"You write STRICT prompts for a code-generation model to produce JUnit {junit_version} unit tests."
     )
     user = f"""
 Return ONLY valid JSON with keys:
@@ -124,10 +164,14 @@ Return ONLY valid JSON with keys:
 Constraints for the generated test class:
 - Output MUST be ONLY Java code (no markdown, no explanations).
 - Start directly with the Java package/import/class declarations. Never include prose before or after the class.
+- Target Java language level: {java_version}. {java_version_guidance(java_version)}
+- Target test framework: JUnit {junit_version}. {junit_imports}
+- {junit_visibility}
+- {junit_forbidden}
 - {framework_rule}
 - Do NOT use @SpringBootTest, MockMvc, WebMvcTest, SecurityMockMvcRequestPostProcessors, SpringExtension, or any Spring test utilities.
 - Do NOT use Spring test annotations (@SpringBootTest, etc.).
-- Do NOT use any libraries beyond JUnit 5 + Mockito.
+- {library_limit}
 - Only use types that appear in the provided snippet/imports (plus {allowed_test_tools}).
 - Do not use Spring/Spring Security test utilities or types unless they already appear in the imports.
 - Use ONLY types already imported by the target class, plus {allowed_test_tools}. Do not introduce new application types (repositories/entities) unless they appear in the target source or imports.
@@ -151,6 +195,7 @@ Constraints for the generated test class:
 - Name the test class exactly as you output in test_class_name.
 - The Java code inside the "prompt" field MUST declare: public class <test_class_name> using the exact test_class_name value from this JSON.
 - Only call methods and access fields that appear in the source snippet, related type sources, or allowlist. Do not invent getters/setters (e.g. getKey()) unless they exist in the provided source.
+- Do NOT call private methods from tests; use only public or protected entry points visible in the snippet.
 - For concrete classes, prefer constructing real instances (using constructors from the source) instead of mocking domain types.
 - When a method parameter is an interface and a concrete implementation exists in the allowlist (e.g. Item -> MyItem), pass real instances like `new MyItem(5)` — never mock interface methods with Mockito.
 - Access public fields directly when no getter exists (e.g. `item.key`, not `item.getKey()`).
@@ -184,12 +229,25 @@ def ollama_repair_test(
     constructor_info: str,
     repository_types: str,
     related_type_sources: str = "",
+    java_version: str = "17",
+    junit_version: str = "5",
 ) -> str:
+    junit_import_note = (
+        "Keep or add org.junit.Test and static org.junit.Assert imports for every annotation/assertion used."
+        if junit_version == "4"
+        else "Keep or add JUnit 5 imports for every annotation/assertion used."
+    )
+    plain_junit_note = (
+        f"rewrite the test as plain JUnit {junit_version} using real objects or static method calls"
+    )
     sys = (
         "You are a senior Java testing expert. "
-        "You fix compilation errors in JUnit5 tests."
+        f"You fix compilation errors in JUnit {junit_version} tests."
     )
     user = f"""
+Target Java version: {java_version}. {java_version_guidance(java_version)}
+Target test framework: JUnit {junit_version}.
+
 Compiler errors:
 {compiler_errors}
 
@@ -212,10 +270,10 @@ Related type sources (only use APIs shown here):
 {related_type_sources or "(none)"}
 
 Instruction: Return corrected Java test file ONLY, keep class name and package, fix typing/import issues, don’t introduce new libraries.
-If compiler errors say org.mockito does not exist, remove every Mockito import/annotation/call and rewrite the test as plain JUnit 5 using real objects or static method calls.
+If compiler errors say org.mockito does not exist, remove every Mockito import/annotation/call and {plain_junit_note}.
 Only call methods and access fields that exist in the related type sources or class under test source. Replace invented methods (e.g. getKey()) with real constructors/fields/APIs from the source.
 Start directly with package/import/class declarations. Do not include markdown fences, headings, bullet lists, or explanations.
-Keep or add JUnit 5 imports for every annotation/assertion used.
+{junit_import_note}
 Do not mock the class or method under test. Each test must call real production code; replace mock-only assertions with real object calls when constructors/source context allow it.
 Do not invent dependency types. If a referenced type (e.g., UserRepository) does not exist in the project, replace it with the closest matching real type from the repository list or remove that dependency and adjust the test accordingly.
 """.strip()
@@ -227,12 +285,17 @@ def ollama_runtime_repair_test(
     model: str,
     stack_trace: str,
     file_content: str,
+    java_version: str = "17",
+    junit_version: str = "5",
 ) -> str:
     sys = (
         "You are a senior Java testing expert. "
-        "You fix runtime errors in JUnit5 + Mockito tests."
+        f"You fix runtime errors in JUnit {junit_version} tests."
     )
     user = f"""
+Target Java version: {java_version}. {java_version_guidance(java_version)}
+Target test framework: JUnit {junit_version}.
+
 Stack trace:
 {stack_trace}
 

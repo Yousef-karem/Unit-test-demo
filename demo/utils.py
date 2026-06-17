@@ -36,10 +36,10 @@ def safe_name(s: str) -> str:
 
 
 def repo_name_from_arg(repo: str) -> str:
-    from demo.repo import is_github_url
+    from demo.repo import github_repo_label, is_github_url
 
     if is_github_url(repo):
-        return safe_repo_dirname(repo)
+        return safe_name(github_repo_label(repo))
     p = Path(repo).expanduser().resolve()
     return safe_name(p.name)
 
@@ -257,17 +257,41 @@ def enforce_test_class_name(code: str, expected_class_name: str) -> str:
     )
 
 
-def ensure_junit5_imports(code: str) -> str:
+def ensure_junit_imports(code: str, junit_version: str = "5") -> str:
     if not code.strip():
         return code
 
     required: List[str] = []
-    if "@Test" in code and "import org.junit.jupiter.api.Test;" not in code:
-        required.append("import org.junit.jupiter.api.Test;")
-    if "@BeforeEach" in code and "import org.junit.jupiter.api.BeforeEach;" not in code:
-        required.append("import org.junit.jupiter.api.BeforeEach;")
-    if "@AfterEach" in code and "import org.junit.jupiter.api.AfterEach;" not in code:
-        required.append("import org.junit.jupiter.api.AfterEach;")
+    if junit_version == "4":
+        if "@Test" in code and "import org.junit.Test;" not in code:
+            required.append("import org.junit.Test;")
+        if "@Before" in code and "import org.junit.Before;" not in code:
+            required.append("import org.junit.Before;")
+        if "@After" in code and "import org.junit.After;" not in code:
+            required.append("import org.junit.After;")
+        uses_assert = any(
+            token in code
+            for token in (
+                "assertEquals",
+                "assertArrayEquals",
+                "assertTrue",
+                "assertFalse",
+                "assertNull",
+                "assertNotNull",
+                "assertSame",
+                "assertNotSame",
+            )
+        )
+        if uses_assert and "import static org.junit.Assert" not in code:
+            required.append("import static org.junit.Assert.*;")
+    else:
+        if "@Test" in code and "import org.junit.jupiter.api.Test;" not in code:
+            required.append("import org.junit.jupiter.api.Test;")
+        if "@BeforeEach" in code and "import org.junit.jupiter.api.BeforeEach;" not in code:
+            required.append("import org.junit.jupiter.api.BeforeEach;")
+        if "@AfterEach" in code and "import org.junit.jupiter.api.AfterEach;" not in code:
+            required.append("import org.junit.jupiter.api.AfterEach;")
+
     if not required:
         return code
 
@@ -282,6 +306,25 @@ def ensure_junit5_imports(code: str) -> str:
     prefix_blank = insert_at > 0 and insert_at < len(lines) and lines[insert_at].strip()
     to_insert = required + ([""] if prefix_blank else [])
     return "\n".join(lines[:insert_at] + to_insert + lines[insert_at:])
+
+
+def ensure_junit5_imports(code: str) -> str:
+    return ensure_junit_imports(code, "5")
+
+
+def validate_junit_framework(code: str, junit_version: str) -> Optional[str]:
+    if junit_version == "4":
+        if re.search(r"\borg\.junit\.jupiter\b", code):
+            return "project uses JUnit 4; remove org.junit.jupiter imports and use org.junit.Test / org.junit.Assert"
+        if re.search(r"@BeforeEach\b|@AfterEach\b", code):
+            return "project uses JUnit 4; use @Before/@After instead of @BeforeEach/@AfterEach"
+        return None
+
+    if re.search(r"import\s+org\.junit\.Test\b", code):
+        return "project uses JUnit 5; use org.junit.jupiter.api.Test instead of org.junit.Test"
+    if re.search(r"import\s+static\s+org\.junit\.Assert\.", code):
+        return "project uses JUnit 5; use org.junit.jupiter.api.Assertions instead of org.junit.Assert"
+    return None
 
 
 def validate_java_test_output(code: str, expected_class_name: Optional[str] = None) -> Optional[str]:

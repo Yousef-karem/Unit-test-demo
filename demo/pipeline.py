@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -13,6 +12,8 @@ from typing import Dict, List
 
 
 from demo.config import (
+    DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
+    DEFAULT_DOCKER_MAVEN_IMAGE,
     DEMO_OUT,
     GENERATED_PATTERN,
     GENERATED_PREFIX,
@@ -20,12 +21,19 @@ from demo.config import (
 from demo.coverage.maven import (
     extract_failing_test_paths,
     extract_first_failing_test_path,
-    maven_executable,
     run_maven_report,
+    run_maven_test_compile,
     run_maven_tests,
     strip_ansi,
     write_failure_artifacts,
 )
+from demo.coverage.java_version import (
+    coerce_supported_version,
+    detect_java_version,
+    java_version_guidance,
+    resolve_project_java_version,
+)
+from demo.coverage.runner import configure_maven_runner, docker_image_name, ensure_docker_available
 from demo.coverage.parse import (
     extract_runtime_failures,
     parse_jacoco_xml,
@@ -45,6 +53,7 @@ from demo.packages import (
     list_java_files,
 )
 from demo.repo import clone_or_update, detect_build_system
+from demo.test_libraries import detect_junit_version
 from demo.static_analysis import (
     project_type_context_from_analysis,
     related_type_sources_from_analysis,
@@ -54,7 +63,7 @@ from demo.static_analysis import (
 from demo.targets import _extract_imports_context_from_text, extract_targets
 from demo.utils import (
     ensure_unique_run_class_name,
-    ensure_junit5_imports,
+    ensure_junit_imports,
     enforce_test_class_name,
     find_concrete_impls,
     load_env_file,
@@ -63,6 +72,7 @@ from demo.utils import (
     rewrite_interface_mocks_to_concrete,
     sanitize_java_output,
     validate_java_test_output,
+    validate_junit_framework,
     validate_test_coverage_quality,
 )
 
@@ -354,6 +364,38 @@ def run_pipeline(args) -> None:
     if build != "maven":
         raise RuntimeError("This demo pipeline.py currently supports Maven repos only (pom.xml).")
 
+    use_docker_maven = getattr(args, "docker_maven", False)
+    project_java_version = resolve_project_java_version(project_root)
+    docker_java_version = coerce_supported_version(project_java_version)
+    pom_java_version = detect_java_version(project_root)
+    compiler_java_version = project_java_version if pom_java_version is None else None
+    docker_image = getattr(args, "docker_maven_image", None) or DEFAULT_DOCKER_MAVEN_IMAGE
+    maven_cache_volume = getattr(args, "docker_maven_cache_volume", DEFAULT_DOCKER_MAVEN_CACHE_VOLUME)
+    configure_maven_runner(
+        use_docker=use_docker_maven,
+        java_version=docker_java_version,
+        docker_image=docker_image,
+        maven_cache_volume=maven_cache_volume,
+        compiler_java_version=compiler_java_version,
+    )
+    if use_docker_maven:
+        ensure_docker_available()
+        print(
+            "Using Docker Maven image:",
+            docker_image_name(),
+            f"(Java {docker_java_version}, project Java {project_java_version}, cache volume: {maven_cache_volume})",
+        )
+    else:
+        print(f"Detected project Java version: {project_java_version}")
+    if compiler_java_version:
+        print(
+            f"Maven compiler properties will use Java {compiler_java_version} "
+            "(pom.xml has no explicit Java version)."
+        )
+
+    junit_version = detect_junit_version(project_root)
+    print(f"Detected JUnit version: {junit_version}")
+
     # 3) Discover packages
     pkgs = discover_packages(project_root)
     selected: List[str] = ["*"]
@@ -413,17 +455,21 @@ def run_pipeline(args) -> None:
     has_mockito = project_has_mockito(project_root)
     for t in targets:
         t["test_libraries"] = {
-            "junit5": True,
+            "junit": junit_version,
             "mockito": has_mockito,
         }
 
     # Save config and target list for reproducibility
     config = {
         "args": vars(args),
+        "resolved_java_version": project_java_version,
+        "docker_java_version": docker_java_version,
+        "maven_compiler_java_version": compiler_java_version,
+        "resolved_junit_version": junit_version,
         "selected_packages": selected,
         "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
         "analysis_mode": analysis_mode,
-        "test_libraries": {"junit5": True, "mockito": has_mockito},
+        "test_libraries": {"junit": junit_version, "mockito": has_mockito},
     }
     (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     (demo_root / "targets.json").write_text(json.dumps(targets, indent=2), encoding="utf-8")
@@ -446,7 +492,7 @@ def run_pipeline(args) -> None:
     generation_quality_log: List[Dict] = []
 
     for i, t in enumerate(targets, 1):
-        g = ollama_write_prompt(args.gpt_model, t, project_types_text)
+        g = ollama_write_prompt(args.gpt_model, t, project_types_text, java_version=project_java_version)
 
         test_class = g.get("test_class_name", "")
         test_class = ensure_unique_test_class_name(test_class, t, args.mode)
@@ -483,7 +529,9 @@ def run_pipeline(args) -> None:
             if impl_hints:
                 base_prompt += "\n\n" + "\n".join(dict.fromkeys(impl_hints))
         prompt_text = (
-            f"Generate a JUnit 5 test class named exactly `{test_class}`.\n\n{base_prompt}"
+            f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
+            f"Target Java version: {project_java_version}. "
+            f"{java_version_guidance(project_java_version)}\n\n{base_prompt}"
         )
         code = ""
         invalid_reason = ""
@@ -491,21 +539,26 @@ def run_pipeline(args) -> None:
         for attempt in range(3):
             code = sanitize_java_output(ollama_generate(args.ollama_model, prompt_text))
             code = enforce_test_class_name(code, test_class)
-            code = ensure_junit5_imports(code)
+            code = ensure_junit_imports(code, junit_version)
             code = remove_invented_api_stubs(code, source_bundle)
             code = rewrite_interface_mocks_to_concrete(code, related_sources)
             invalid_reason = (
                 validate_java_test_output(code, test_class)
+                or validate_junit_framework(code, junit_version)
                 or validate_test_coverage_quality(code, t, related_sources)
                 or ""
             )
             if not invalid_reason and not (t.get("test_libraries") or {}).get("mockito", True):
                 if re.search(r"\borg\.mockito\b|@Mock\b|@InjectMocks\b|\bMockito\b|\bwhen\s*\(", code):
-                    invalid_reason = "project has no Mockito dependency; rewrite as plain JUnit 5 with no Mockito"
+                    invalid_reason = (
+                        f"project has no Mockito dependency; rewrite as plain JUnit {junit_version} with no Mockito"
+                    )
             if not invalid_reason:
                 break
             prompt_text = (
-                f"Generate a JUnit 5 test class named exactly `{test_class}`.\n\n{base_prompt}\n\n"
+                f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
+                f"Target Java version: {project_java_version}. "
+                f"{java_version_guidance(project_java_version)}\n\n{base_prompt}\n\n"
                 f"Previous output was invalid because: {invalid_reason}. "
                 "Return ONLY the complete Java test file, with no markdown or explanation."
             )
@@ -580,25 +633,14 @@ def run_pipeline(args) -> None:
     # --- Phase A: GPT compile-repair first (up to 10 iterations) ---
     print("Running Maven with RAT, Checkstyle, and Enforcer skipped for coverage-only execution.")
     for _ in range(10):
-        cmd = [
-            maven_executable(),
-            "-Drat.skip=true",
-            "-Dcheckstyle.skip=true",
-            "-Denforcer.skip=true",
-            "-q",
-            "-Dstyle.color=never",
-            f"-Dtest={GENERATED_PATTERN}",
-            "test-compile",
-        ]
-        p = subprocess.run(cmd, cwd=str(project_root), text=True, capture_output=True)
-        last_compile_log = (p.stdout or "") + "\n" + (p.stderr or "")
+        last_compile_log, compile_rc = run_maven_test_compile(project_root)
 
         # FIX #1: always append compile log during REPAIR phase too
         with compile_log_path.open("a", encoding="utf-8") as f:
             f.write(last_compile_log)
             f.write("\n" + ("-" * 80) + "\n")
 
-        if p.returncode == 0:
+        if compile_rc == 0:
             break
 
         failing_path = extract_first_failing_test_path(last_compile_log)
@@ -682,10 +724,12 @@ def run_pipeline(args) -> None:
             constructor_info=constructor_info,
             repository_types=repo_types_text,
             related_type_sources=related_sources,
+            java_version=project_java_version,
+            junit_version=junit_version,
         )
 
         fixed_code = enforce_test_class_name(fixed_code, test_class)
-        fixed_code = ensure_junit5_imports(fixed_code)
+        fixed_code = ensure_junit_imports(fixed_code, junit_version)
         fixed_code = remove_invented_api_stubs(fixed_code, source_bundle)
         fixed_code = rewrite_interface_mocks_to_concrete(fixed_code, related_sources)
 
@@ -722,24 +766,13 @@ def run_pipeline(args) -> None:
 
     # --- Phase B: Compile gate loop (move remaining failing tests) ---
     for _ in range(10):
-        cmd = [
-            maven_executable(),
-            "-Drat.skip=true",
-            "-Dcheckstyle.skip=true",
-            "-Denforcer.skip=true",
-            "-q",
-            "-Dstyle.color=never",
-            f"-Dtest={GENERATED_PATTERN}",
-            "test-compile",
-        ]
-        p = subprocess.run(cmd, cwd=str(project_root), text=True, capture_output=True)
-        last_compile_log = (p.stdout or "") + "\n" + (p.stderr or "")
+        last_compile_log, compile_rc = run_maven_test_compile(project_root)
 
         with compile_log_path.open("a", encoding="utf-8") as f:
             f.write(last_compile_log)
             f.write("\n" + ("-" * 80) + "\n")
 
-        if p.returncode == 0:
+        if compile_rc == 0:
             break
 
         failing_paths = extract_failing_test_paths(last_compile_log)
@@ -848,6 +881,8 @@ def run_pipeline(args) -> None:
                     model=args.gpt_model,
                     stack_trace=stack_trace,
                     file_content=file_content,
+                    java_version=project_java_version,
+                    junit_version=junit_version,
                 )
 
                 if not fixed_code.strip():
