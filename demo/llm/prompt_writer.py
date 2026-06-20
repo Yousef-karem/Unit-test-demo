@@ -285,6 +285,8 @@ def ollama_runtime_repair_test(
     model: str,
     stack_trace: str,
     file_content: str,
+    source_text: str = "",
+    related_type_sources: str = "",
     java_version: str = "17",
     junit_version: str = "5",
 ) -> str:
@@ -302,7 +304,15 @@ Stack trace:
 File content:
 {file_content}
 
+Class under test source:
+{source_text or "(not provided)"}
+
+Related type sources / AST summaries:
+{related_type_sources or "(not provided)"}
+
 Instruction: Return corrected Java test file ONLY, keep class name and package, fix runtime errors, don’t introduce new libraries.
+If the stack trace shows a NullPointerException from an array element or interface value, replace null/mocked domain values with real concrete instances from related type sources.
+For interface parameters, use concrete implementations and constructors shown above. Do not mock domain/value interfaces when concrete implementations exist.
 """.strip()
 
     return sanitize_java_output(ollama_generate_text(model, user, sys))

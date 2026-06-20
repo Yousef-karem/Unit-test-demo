@@ -333,6 +333,94 @@ def restore_isolated_test_files(moved: List[Dict[str, str]]) -> None:
         shutil.move(str(src), str(dst))
 
 
+def patch_obsolete_tools_jar_dependency(project_root: Path) -> bool:
+    """Remove old JDK 8 tools.jar system dependencies that break on modern JDKs."""
+    pom = project_root / "pom.xml"
+    if not pom.is_file():
+        return False
+    try:
+        text = pom.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    if "tools.jar" not in text and "<artifactId>tools</artifactId>" not in text:
+        return False
+
+    dep_re = re.compile(r"\s*<dependency>[\s\S]*?</dependency>", re.IGNORECASE)
+
+    def keep_or_remove(match: re.Match) -> str:
+        block = match.group(0)
+        is_tools = (
+            re.search(r"<groupId>\s*com\.sun\s*</groupId>", block, re.IGNORECASE)
+            and re.search(r"<artifactId>\s*tools\s*</artifactId>", block, re.IGNORECASE)
+        )
+        return "" if is_tools else block
+
+    patched = dep_re.sub(keep_or_remove, text)
+    if patched == text:
+        return False
+    pom.write_text(patched, encoding="utf-8")
+    return True
+
+
+def looks_like_java_test_file(text: str) -> bool:
+    sample = (text or "").lstrip()
+    return bool(
+        re.search(r"(?m)^\s*package\s+[\w.]+\s*;", sample)
+        or re.search(r"(?m)^\s*import\s+", sample)
+        or re.search(r"\bclass\s+\w+Test\b", sample)
+    )
+
+
+def build_direct_generation_prompt(
+    target: Dict,
+    test_class: str,
+    project_types_text: str,
+    java_version: str,
+    junit_version: str,
+    has_mockito: bool,
+) -> str:
+    pkg = target.get("package") or "(default)"
+    mockito_rule = (
+        "Mockito is available, but do NOT mock domain/value interfaces when a concrete implementation exists. "
+        "Prefer real objects so production code executes."
+        if has_mockito
+        else "Mockito is not available; do not import or use org.mockito, @Mock, when, verify, or MockitoAnnotations."
+    )
+    junit_rule = (
+        "Use org.junit.Test and static org.junit.Assert.*. Do not use JUnit Jupiter."
+        if junit_version == "4"
+        else "Use org.junit.jupiter.api.Test and org.junit.jupiter.api.Assertions.*. Do not use org.junit.Test."
+    )
+    return f"""
+Output ONLY a complete Java test file. No markdown. No explanations.
+Generate test class exactly: {test_class}
+Package: {pkg}
+Target Java version: {java_version}. {java_version_guidance(java_version)}
+Target framework: JUnit {junit_version}. {junit_rule}
+{mockito_rule}
+
+Hard rules:
+- Every @Test must call real production code from target class {target.get("class_name")}.
+- Do not mock the class under test.
+- For interface parameters, use a concrete implementation from the project type context when present.
+- Do not put null as the first element of arrays unless the test explicitly expects NullPointerException.
+- For Item[] or similar arrays, create non-null concrete Item implementations for all normal-path tests.
+- Use only methods, fields, and constructors shown in the source/AST/project type context.
+- At least 3 @Test methods with concrete assertions.
+
+Target:
+- class: {target.get("class_name")}
+- method: {target.get("method_name") or "(class mode)"}
+- signature: {target.get("signature") or "(entire class)"}
+
+Source/AST summary:
+{target.get("snippet") or ""}
+
+Project type context:
+{project_types_text}
+""".strip()
+
+
 # ----------------------------
 # Pipeline
 # ----------------------------
@@ -345,6 +433,8 @@ def run_pipeline(args) -> None:
     run_root = DEMO_OUT / repo_name / "runs" / timestamp
     run_root.mkdir(parents=True, exist_ok=True)
     project_root = clone_or_update(args.repo, run_root / "repo", args.branch)
+    if patch_obsolete_tools_jar_dependency(project_root):
+        print("Patched obsolete com.sun:tools/tools.jar dependency for modern JDK compatibility.")
 
     demo_root = run_root / "DemoTestCases"
     (demo_root / "prompts").mkdir(parents=True, exist_ok=True)
@@ -512,7 +602,16 @@ def run_pipeline(args) -> None:
             if ast_analysis is not None
             else collect_related_type_sources(project_root, t)
         )
-        base_prompt = g["prompt"]
+        base_prompt = g.get("prompt", "")
+        if looks_like_java_test_file(base_prompt):
+            base_prompt = build_direct_generation_prompt(
+                target=t,
+                test_class=test_class,
+                project_types_text=project_types_text,
+                java_version=project_java_version,
+                junit_version=junit_version,
+                has_mockito=has_mockito,
+            )
         if related_sources:
             impl_hints: List[str] = []
             sig_text = t.get("signature") or ""
@@ -876,11 +975,48 @@ def run_pipeline(args) -> None:
                 except FileNotFoundError:
                     continue
 
+                test_class = failing_path.stem
+                target = test_target_map.get(test_class, {})
+                runtime_source_text = ""
+                runtime_related_sources = (
+                    related_type_sources_from_analysis(ast_analysis, target)
+                    if ast_analysis is not None
+                    else collect_related_type_sources(project_root, target)
+                )
+                src_path = target.get("source_file")
+                if src_path:
+                    try:
+                        runtime_source_text = Path(src_path).read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        pass
+
+                source_bundle = f"{runtime_related_sources}\n{runtime_source_text}"
+                deterministic_fix = remove_invented_api_stubs(file_content, source_bundle)
+                deterministic_fix = rewrite_interface_mocks_to_concrete(
+                    deterministic_fix, runtime_related_sources
+                )
+                if deterministic_fix != file_content:
+                    deterministic_fix = enforce_test_class_name(deterministic_fix, test_class)
+                    deterministic_fix = ensure_junit_imports(deterministic_fix, junit_version)
+                    failing_path.write_text(deterministic_fix, encoding="utf-8")
+                    runtime_retries[fp] = retries + 1
+                    runtime_repair_log.append(
+                        {
+                            "file": fp,
+                            "action": "deterministic_runtime_rewrite",
+                            "errors_tail": "\n".join(strip_ansi(stack_trace).splitlines()[-80:]),
+                        }
+                    )
+                    changed_any = True
+                    continue
+
                 # FIX #2: keyword call (avoids args/positional confusion)
                 fixed_code = ollama_runtime_repair_test(
                     model=args.gpt_model,
                     stack_trace=stack_trace,
                     file_content=file_content,
+                    source_text=runtime_source_text,
+                    related_type_sources=runtime_related_sources,
                     java_version=project_java_version,
                     junit_version=junit_version,
                 )
@@ -897,6 +1033,11 @@ def run_pipeline(args) -> None:
                     )
                     changed_any = True
                     continue
+
+                fixed_code = enforce_test_class_name(fixed_code, test_class)
+                fixed_code = ensure_junit_imports(fixed_code, junit_version)
+                fixed_code = remove_invented_api_stubs(fixed_code, source_bundle)
+                fixed_code = rewrite_interface_mocks_to_concrete(fixed_code, runtime_related_sources)
 
                 failing_path.write_text(fixed_code, encoding="utf-8")
                 runtime_retries[fp] = retries + 1
