@@ -215,10 +215,34 @@ def class_ast_summary(fqcn: str, class_info: Dict) -> str:
         f"class: {fqcn}",
         f"kind: {class_info.get('kind', 'class')}",
     ]
+    if class_info.get("domainKind"):
+        lines.append(f"domainKind: {class_info['domainKind']}")
+    if class_info.get("annotations"):
+        lines.append(f"annotations: {', '.join(class_info['annotations'])}")
     if class_info.get("extendsClass"):
         lines.append(f"extends: {class_info['extendsClass']}")
     if class_info.get("implementsList"):
         lines.append(f"implements: {', '.join(class_info['implementsList'])}")
+    if class_info.get("autowiredComponents"):
+        lines.append("autowiredComponents:")
+        lines.extend(f"- {item}" for item in class_info["autowiredComponents"][:20])
+    fields = class_info.get("fields") or []
+    if fields:
+        lines.append("fields:")
+        for field in fields[:30]:
+            mods = " ".join(field.get("modifiers") or [])
+            field_type = field.get("resolvedType") or field.get("type") or "Object"
+            anns = field.get("annotations") or []
+            ann_text = f" @{','.join(anns)}" if anns else ""
+            lines.append(f"- {mods} {field_type} {field.get('name', '')}{ann_text}".strip())
+    constructors = class_info.get("constructors") or []
+    if constructors:
+        lines.append("constructors:")
+        for ctor in constructors[:12]:
+            lines.append(f"- {ctor.get('signature', 'constructor')}")
+            snippet = (ctor.get("sourceSnippet") or "").strip()
+            if snippet:
+                lines.append(f"  snippet: {snippet[:240]}")
     lines.append("methods:")
     for sig, method in (class_info.get("methods") or {}).items():
         lines.append(f"- {method.get('returnType', 'void')} {sig}")
@@ -296,6 +320,8 @@ def project_type_context_from_analysis(analysis: Dict) -> List[str]:
             continue
         _, name = split_fqcn(fqcn)
         detail = f"{class_info.get('kind', 'class')} {name}"
+        if class_info.get("domainKind"):
+            detail += f" [{class_info['domainKind']}]"
         if class_info.get("extendsClass"):
             detail += f" extends {class_info['extendsClass']}"
         if class_info.get("implementsList"):
@@ -305,6 +331,22 @@ def project_type_context_from_analysis(analysis: Dict) -> List[str]:
             methods.append(f"{method.get('returnType', 'void')} {sig}")
         if methods:
             detail += " api: " + "; ".join(methods[:12])
+        ctor_params = []
+        for ctor in class_info.get("constructors") or []:
+            params = ctor.get("parameters") or []
+            ctor_params.append(
+                ", ".join(f"{p.get('type', 'Object')} {p.get('name', 'arg')}" for p in params)
+            )
+        if ctor_params:
+            detail += f" constructors: {'; '.join(ctor_params[:6])}"
+        field_names = []
+        for field in class_info.get("fields") or []:
+            if "public" in (field.get("modifiers") or []):
+                field_names.append(
+                    f"{field.get('resolvedType') or field.get('type', 'Object')} {field.get('name', '')}"
+                )
+        if field_names:
+            detail += f" fields: {'; '.join(field_names[:8])}"
         context.append(detail)
     return sorted(context)
 
