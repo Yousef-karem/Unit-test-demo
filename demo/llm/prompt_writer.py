@@ -285,6 +285,7 @@ def ollama_runtime_repair_test(
     model: str,
     stack_trace: str,
     file_content: str,
+    failing_method: str = "",
     source_text: str = "",
     related_type_sources: str = "",
     java_version: str = "17",
@@ -297,6 +298,9 @@ def ollama_runtime_repair_test(
     user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
+
+Failing test method:
+{failing_method or "(not provided)"}
 
 Stack trace:
 {stack_trace}

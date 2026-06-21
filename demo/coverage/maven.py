@@ -48,9 +48,10 @@ def _maven_base_args() -> List[str]:
     return args
 
 
-def _generated_test_surefire_args() -> List[str]:
+def _generated_test_surefire_args(test_filter: str | None = None) -> List[str]:
+    test_expr = test_filter or GENERATED_PATTERN
     return [
-        f"-Dtest={GENERATED_PATTERN}",
+        f"-Dtest={test_expr}",
         f"-Dsurefire.includes=**/{GENERATED_PATTERN}.java",
     ]
 
@@ -59,18 +60,18 @@ def project_has_jacoco(project_root: Path) -> bool:
     return "<artifactId>jacoco-maven-plugin</artifactId>" in (project_root / "pom.xml").read_text()
 
 
-def run_maven_test_compile(project_root: Path) -> Tuple[str, int]:
-    cmd = _maven_base_args() + _generated_test_surefire_args() + ["test-compile"]
+def run_maven_test_compile(project_root: Path, test_filter: str | None = None) -> Tuple[str, int]:
+    cmd = _maven_base_args() + _generated_test_surefire_args(test_filter) + ["test-compile"]
     return run_maven(cmd, project_root)
 
 
-def run_maven_tests(project_root: Path) -> Tuple[str, int]:
+def run_maven_tests(project_root: Path, test_filter: str | None = None) -> Tuple[str, int]:
     if project_has_jacoco(project_root):
-        cmd = _maven_base_args() + _generated_test_surefire_args() + ["test"]
+        cmd = _maven_base_args() + _generated_test_surefire_args(test_filter) + ["test"]
     else:
         cmd = _maven_base_args() + [
             "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
-            *_generated_test_surefire_args(),
+            *_generated_test_surefire_args(test_filter),
             "test",
         ]
     return run_maven(cmd, project_root)

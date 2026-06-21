@@ -579,6 +579,23 @@ A “target” means:
 
 ---
 
+### `--max-refinement-iterations`
+
+**What it does:** Sets how many times the feedback loop may repair a generated test after compile or runtime failure.
+
+**Example:**
+
+```bash
+--max-refinement-iterations 5
+```
+
+**Impact:**
+
+* Higher value → more CubeTester-style refinement attempts
+* Lower value → faster runs with more rejected tests
+
+---
+
 ### `--packages`
 
 **What it does:** Restricts generation to specific packages only.
@@ -643,7 +660,7 @@ mvn -q -Dtest=LLM_Generated*Test test-compile
 
 If compilation fails:
 
-* GPT tries to repair the failing file
+* GPT tries to repair the failing file up to `--max-refinement-iterations`
 * unrepaired tests are moved to `DemoTestCases/rejected/compile/`
 
 ### Maven (runtime + coverage stage)
@@ -657,7 +674,7 @@ mvn -q org.jacoco:jacoco-maven-plugin:0.8.12:report
 
 If runtime errors occur:
 
-* GPT tries runtime repairs
+* GPT tries runtime repairs up to `--max-refinement-iterations`
 * unrepaired tests are moved to `DemoTestCases/rejected/runtime/`
 
 ### Gradle (coverage stage)

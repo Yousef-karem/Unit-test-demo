@@ -5,9 +5,10 @@ import json
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterator, List
 
 
 
@@ -333,6 +334,96 @@ def restore_isolated_test_files(moved: List[Dict[str, str]]) -> None:
         shutil.move(str(src), str(dst))
 
 
+@contextmanager
+def isolate_generated_tests_except(
+    project_root: Path, keep_path: Path, backup_root: Path
+) -> Iterator[List[Dict[str, str]]]:
+    """
+    Temporarily move every generated test except keep_path out of src/test/java.
+    This mirrors CubeTester-style focused refinement: compiler/runtime logs should
+    describe the specific generated test being repaired, not unrelated failures.
+    """
+    test_root = project_root / "src" / "test" / "java"
+    moved: List[Dict[str, str]] = []
+    if not test_root.exists():
+        yield moved
+        return
+
+    try:
+        keep_resolved = keep_path.resolve()
+    except OSError:
+        keep_resolved = keep_path
+
+    for test_file in test_root.rglob(f"{GENERATED_PREFIX}*Test.java"):
+        try:
+            resolved = test_file.resolve()
+        except OSError:
+            resolved = test_file
+        if resolved == keep_resolved:
+            continue
+        rel = test_file.relative_to(test_root)
+        dest = backup_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(test_file), str(dest))
+        moved.append({"from": str(test_file), "to": str(dest)})
+
+    try:
+        yield moved
+    finally:
+        restore_isolated_test_files(moved)
+
+
+def concise_error_log(log: str, max_lines: int = 80) -> str:
+    lines = strip_ansi(log).splitlines()
+    important = [
+        line
+        for line in lines
+        if (
+            "[ERROR]" in line
+            or "Failed tests:" in line
+            or "Errors:" in line
+            or "Failures:" in line
+            or "Exception" in line
+            or "Caused by:" in line
+            or "cannot find symbol" in line
+        )
+    ]
+    selected = important or lines
+    return "\n".join(selected[-max_lines:])
+
+
+def resolve_maven_test_path(project_root: Path, reported_path: Path) -> Path:
+    if reported_path.exists():
+        return reported_path
+
+    parts = list(reported_path.parts)
+    lowered = [p.lower() for p in parts]
+    try:
+        src_i = lowered.index("src")
+        if lowered[src_i : src_i + 3] == ["src", "test", "java"]:
+            return project_root / Path(*parts[src_i:])
+    except ValueError:
+        pass
+    return reported_path
+
+
+def add_throws_exception_to_test_methods(code: str, compiler_errors: str) -> str:
+    if "unreported exception" not in compiler_errors:
+        return code
+
+    def fix_signature(match: re.Match) -> str:
+        signature = match.group(0)
+        if " throws " in signature:
+            return signature
+        return signature[:-1].rstrip() + " throws Exception {"
+
+    return re.sub(
+        r"(?m)^\s*(?:public\s+)?void\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*\{",
+        fix_signature,
+        code,
+    )
+
+
 def patch_obsolete_tools_jar_dependency(project_root: Path) -> bool:
     """Remove old JDK 8 tools.jar system dependencies that break on modern JDKs."""
     pom = project_root / "pom.xml"
@@ -446,6 +537,7 @@ def run_pipeline(args) -> None:
     (demo_root / "rejected" / "compile").mkdir(parents=True, exist_ok=True)
     (demo_root / "rejected" / "runtime").mkdir(parents=True, exist_ok=True)
     rejected_compile_root = demo_root / "rejected" / "compile"
+    max_refinement_iterations = max(0, int(getattr(args, "max_refinement_iterations", 5)))
 
     # 2) Detect build system
     build = args.build
@@ -559,6 +651,7 @@ def run_pipeline(args) -> None:
         "selected_packages": selected,
         "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
         "analysis_mode": analysis_mode,
+        "max_refinement_iterations": max_refinement_iterations,
         "test_libraries": {"junit": junit_version, "mockito": has_mockito},
     }
     (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -729,9 +822,9 @@ def run_pipeline(args) -> None:
         )
         return str(dest)
 
-    # --- Phase A: GPT compile-repair first (up to 10 iterations) ---
+    # --- Phase A: focused compile refinement ---
     print("Running Maven with RAT, Checkstyle, and Enforcer skipped for coverage-only execution.")
-    for _ in range(10):
+    for _ in range(max(1, len(generated_paths) * (max_refinement_iterations + 1))):
         last_compile_log, compile_rc = run_maven_test_compile(project_root)
 
         # FIX #1: always append compile log during REPAIR phase too
@@ -749,25 +842,39 @@ def run_pipeline(args) -> None:
                 "maven test-compile failed due to non-generated test compile errors"
             )
             break
+        failing_path = resolve_maven_test_path(project_root, failing_path)
 
         # save "before repair" artifacts
+        with isolate_generated_tests_except(
+            project_root,
+            failing_path,
+            demo_root / "isolation" / "compile_refinement",
+        ):
+            focused_compile_log, focused_compile_rc = run_maven_test_compile(
+                project_root, test_filter=failing_path.stem
+            )
+        if focused_compile_rc != 0:
+            last_compile_log = focused_compile_log
+
         write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_before")
 
         fp = str(failing_path)
         retries = retry_counts.get(fp, 0)
 
         # exceeded retries -> move to rejected so summaries and artifacts reflect it.
-        if retries >= 2:
+        if retries >= max_refinement_iterations:
             write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
             moved_to = move_to_rejected_compile(
-                failing_path, last_compile_log, action="deleted_after_2_repairs"
+                failing_path,
+                last_compile_log,
+                action=f"deleted_after_{max_refinement_iterations}_repairs",
             )
             repair_log.append(
                 {
                     "file": fp,
                     "moved_to": moved_to,
-                    "errors_tail": "\n".join(strip_ansi(last_compile_log).splitlines()[-80:]),
-                    "action": "deleted_after_2_repairs",
+                    "errors_tail": concise_error_log(last_compile_log),
+                    "action": f"deleted_after_{max_refinement_iterations}_repairs",
                 }
             )
             generated_paths = [p for p in generated_paths if Path(p).exists()]
@@ -803,13 +910,14 @@ def run_pipeline(args) -> None:
         source_bundle = f"{related_sources}\n{source_text}"
         stub_fixed = remove_invented_api_stubs(file_content, source_bundle)
         stub_fixed = rewrite_interface_mocks_to_concrete(stub_fixed, related_sources)
+        stub_fixed = add_throws_exception_to_test_methods(stub_fixed, last_compile_log)
         if stub_fixed != file_content:
             failing_path.write_text(stub_fixed, encoding="utf-8")
             repair_log.append(
                 {
                     "file": fp,
                     "action": "deterministic_stub_removal",
-                    "errors_tail": "\n".join(strip_ansi(last_compile_log).splitlines()[-20:]),
+                    "errors_tail": concise_error_log(last_compile_log, max_lines=20),
                 }
             )
             continue
@@ -831,6 +939,7 @@ def run_pipeline(args) -> None:
         fixed_code = ensure_junit_imports(fixed_code, junit_version)
         fixed_code = remove_invented_api_stubs(fixed_code, source_bundle)
         fixed_code = rewrite_interface_mocks_to_concrete(fixed_code, related_sources)
+        fixed_code = add_throws_exception_to_test_methods(fixed_code, last_compile_log)
 
         invalid_fix_reason = validate_java_test_output(fixed_code, test_class)
         if not fixed_code.strip() or invalid_fix_reason:
@@ -840,7 +949,7 @@ def run_pipeline(args) -> None:
                 {
                     "file": fp,
                     "invalid_fix_reason": invalid_fix_reason,
-                    "errors_tail": "\n".join(strip_ansi(last_compile_log).splitlines()[-80:]),
+                    "errors_tail": concise_error_log(last_compile_log),
                     "action": "invalid_or_empty_fix",
                 }
             )
@@ -851,7 +960,7 @@ def run_pipeline(args) -> None:
         repair_log.append(
             {
                 "file": fp,
-                "errors_tail": "\n".join(strip_ansi(last_compile_log).splitlines()[-80:]),
+                "errors_tail": concise_error_log(last_compile_log),
                 "action": "fixed",
             }
         )
@@ -875,6 +984,7 @@ def run_pipeline(args) -> None:
             break
 
         failing_paths = extract_failing_test_paths(last_compile_log)
+        failing_paths = [resolve_maven_test_path(project_root, p) for p in failing_paths]
         if not failing_paths:
             compile_blocked = True
             compile_blocked_reason = (
@@ -935,7 +1045,7 @@ def run_pipeline(args) -> None:
                 }
             )
 
-        for _ in range(10):
+        for _ in range(max(1, len(generated_paths) * (max_refinement_iterations + 1))):
             test_log, test_rc = run_maven_tests(project_root)
             (demo_root / "runtime" / "test_log.txt").write_text(test_log, encoding="utf-8")
 
@@ -946,25 +1056,42 @@ def run_pipeline(args) -> None:
             changed_any = False
             for f in failures:
                 class_name = f.get("class_name", "")
+                method_name = f.get("method_name", "")
                 stack_trace = f.get("stack_trace", "")
                 rel = Path("src/test/java") / Path(class_name.replace(".", "/") + ".java")
                 failing_path = project_root / rel
                 fp = str(failing_path)
+                retry_key = f"{fp}::{method_name or '*'}"
 
                 if not failing_path.exists():
                     continue
 
+                test_filter = class_name.rsplit(".", 1)[-1]
+                if method_name:
+                    test_filter = f"{test_filter}#{method_name}"
+                with isolate_generated_tests_except(
+                    project_root,
+                    failing_path,
+                    demo_root / "isolation" / "runtime_refinement",
+                ):
+                    focused_test_log, focused_test_rc = run_maven_tests(
+                        project_root, test_filter=test_filter
+                    )
+                if focused_test_rc != 0:
+                    stack_trace = stack_trace or concise_error_log(focused_test_log)
+
                 write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_before")
 
-                retries = runtime_retries.get(fp, 0)
-                if retries >= 2:
+                retries = runtime_retries.get(retry_key, 0)
+                if retries >= max_refinement_iterations:
                     write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_final")
                     move_to_rejected_runtime(failing_path, stack_trace, action="rejected")
                     runtime_repair_log.append(
                         {
                             "file": fp,
+                            "method": method_name or None,
                             "action": "rejected",
-                            "errors_tail": "\n".join(strip_ansi(stack_trace).splitlines()[-80:]),
+                            "errors_tail": concise_error_log(stack_trace),
                         }
                     )
                     changed_any = True
@@ -999,12 +1126,13 @@ def run_pipeline(args) -> None:
                     deterministic_fix = enforce_test_class_name(deterministic_fix, test_class)
                     deterministic_fix = ensure_junit_imports(deterministic_fix, junit_version)
                     failing_path.write_text(deterministic_fix, encoding="utf-8")
-                    runtime_retries[fp] = retries + 1
+                    runtime_retries[retry_key] = retries + 1
                     runtime_repair_log.append(
                         {
                             "file": fp,
+                            "method": method_name or None,
                             "action": "deterministic_runtime_rewrite",
-                            "errors_tail": "\n".join(strip_ansi(stack_trace).splitlines()[-80:]),
+                            "errors_tail": concise_error_log(stack_trace),
                         }
                     )
                     changed_any = True
@@ -1015,6 +1143,7 @@ def run_pipeline(args) -> None:
                     model=args.gpt_model,
                     stack_trace=stack_trace,
                     file_content=file_content,
+                    failing_method=method_name,
                     source_text=runtime_source_text,
                     related_type_sources=runtime_related_sources,
                     java_version=project_java_version,
@@ -1027,8 +1156,9 @@ def run_pipeline(args) -> None:
                     runtime_repair_log.append(
                         {
                             "file": fp,
+                            "method": method_name or None,
                             "action": "rejected_empty_fix",
-                            "errors_tail": "\n".join(strip_ansi(stack_trace).splitlines()[-80:]),
+                            "errors_tail": concise_error_log(stack_trace),
                         }
                     )
                     changed_any = True
@@ -1040,12 +1170,13 @@ def run_pipeline(args) -> None:
                 fixed_code = rewrite_interface_mocks_to_concrete(fixed_code, runtime_related_sources)
 
                 failing_path.write_text(fixed_code, encoding="utf-8")
-                runtime_retries[fp] = retries + 1
+                runtime_retries[retry_key] = retries + 1
                 runtime_repair_log.append(
                     {
                         "file": fp,
+                        "method": method_name or None,
                         "action": "fixed",
-                        "errors_tail": "\n".join(strip_ansi(stack_trace).splitlines()[-80:]),
+                        "errors_tail": concise_error_log(stack_trace),
                     }
                 )
                 changed_any = True
@@ -1140,6 +1271,7 @@ def run_pipeline(args) -> None:
         "selected_packages": selected,
         "ollama_model": args.ollama_model,
         "gpt_model": args.gpt_model,
+        "max_refinement_iterations": max_refinement_iterations,
         "generated_total": len(written_paths) + len(generation_quality_log),
         "generated_written": len(written_paths),
         "generation_rejected": len(generation_quality_log),

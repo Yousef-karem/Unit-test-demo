@@ -210,8 +210,8 @@ The function `run_pipeline()` in `demo/pipeline.py` executes these steps:
 **Quality gates:**
 
 - **Generation gate** — rejects invalid LLM output before writing to repo
-- **Compile gate** — up to 2 LLM repairs per file, then moves to `rejected/compile/`
-- **Runtime gate** — up to 2 LLM repairs per file, then moves to `rejected/runtime/`
+- **Compile gate** — up to `--max-refinement-iterations` LLM repairs per file, then moves to `rejected/compile/`
+- **Runtime gate** — up to `--max-refinement-iterations` LLM repairs per failing method/file, then moves to `rejected/runtime/`
 
 If **zero tests compile**, the runtime stage is skipped and coverage is 0%.
 
@@ -293,6 +293,7 @@ Creates an `argparse` parser and passes parsed args to `run_pipeline()`.
 | `--gpt-model` | string | `qwen2.5-coder:7b` | Model for **prompts and repairs** |
 | `--max-files` | int | `10` | Max source `.java` files to scan |
 | `--max-targets` | int | `50` | Max targets (classes or methods) to test |
+| `--max-refinement-iterations` | int | `5` | Max compile/runtime repair attempts per generated test |
 | `--skip-framework-classes` | bool | `True` | Skip classes named *Application*, *Config*, *Filter*, etc. |
 | `--no-skip-framework-classes` | flag | — | Disable framework class filtering |
 | `--docker-maven` | flag | off | Run Maven compile/test/coverage inside Docker |
@@ -556,9 +557,9 @@ Parameters:
 - `source_text` — class under test source
 - `package_imports`, `constructor_info`, `repository_types`, `related_type_sources` — context
 
-### `ollama_runtime_repair_test(model, stack_trace, file_content) -> str`
+### `ollama_runtime_repair_test(model, stack_trace, file_content, failing_method="") -> str`
 
-**Runtime repair.** Sends Surefire stack trace + test file. Returns fixed Java.
+**Runtime repair.** Sends Surefire stack trace + failing method name + test file. Returns fixed Java.
 
 ---
 
@@ -617,7 +618,7 @@ Called at pipeline startup from `run_pipeline()` when `--docker-maven` is set. V
 
 Checks if `pom.xml` contains `jacoco-maven-plugin`.
 
-### `run_maven_test_compile(project_root) -> (log, return_code)`
+### `run_maven_test_compile(project_root, test_filter=None) -> (log, return_code)`
 
 ```bash
 mvn -Drat.skip=true -Dcheckstyle.skip=true -Denforcer.skip=true \
@@ -626,7 +627,7 @@ mvn -Drat.skip=true -Dcheckstyle.skip=true -Denforcer.skip=true \
 
 Used by compile repair and compile gate loops in `pipeline.py`.
 
-### `run_maven_tests(project_root) -> (log, return_code)`
+### `run_maven_tests(project_root, test_filter=None) -> (log, return_code)`
 
 Runs generated tests with JaCoCo:
 
@@ -848,9 +849,9 @@ For each target:
 
 Moves pre-existing tests aside. Logs count.
 
-#### Step 6 — Compile repair Phase A (lines ~513–642)
+#### Step 6 — Compile repair Phase A
 
-Loop up to 10 times:
+Loop until all generated tests compile, all failing tests are rejected, or each failing test reaches `--max-refinement-iterations`:
 1. Run `mvn test-compile -Dtest=LLM_Generated*Test`
 2. If success → break
 3. Find first failing test path from log
@@ -867,14 +868,14 @@ Strict gate: any remaining compile failures → move to `rejected/compile/` with
 
 Computes `compile_survivors` and `compile_rejected`.
 
-#### Step 7 — Runtime stage (lines ~711–816)
+#### Step 7 — Runtime stage
 
 Skipped if `compile_survivors == 0`.
 
-Loop up to 10 times:
+Loop until generated tests pass, failing tests are rejected, or each failing test reaches `--max-refinement-iterations`:
 1. **`run_maven_tests`** with JaCoCo
 2. **`extract_runtime_failures`** from Surefire XML
-3. For each failure: up to 2 **`ollama_runtime_repair_test`** attempts
+3. For each failure: up to `--max-refinement-iterations` **`ollama_runtime_repair_test`** attempts
 4. Unrecoverable → `rejected/runtime/`
 
 Then **`run_maven_report`**.

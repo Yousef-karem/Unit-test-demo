@@ -45,6 +45,12 @@ def main() -> None:
     ap.add_argument("--max-files", type=int, default=10, help="Safety limit for demo; increase if you want")
     ap.add_argument("--max-targets", type=int, default=50, help="Safety limit for demo; increase if you want")
     ap.add_argument(
+        "--max-refinement-iterations",
+        type=int,
+        default=5,
+        help="Maximum LLM repair attempts per generated test during compile/runtime refinement",
+    )
+    ap.add_argument(
         "--skip-framework-classes",
         default=True,
         action=argparse.BooleanOptionalAction,
