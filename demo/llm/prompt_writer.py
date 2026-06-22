@@ -118,34 +118,39 @@ def _junit_prompt_rules(junit_version: str, has_mockito: bool) -> Tuple[str, str
     return framework_rule, allowed_test_tools, library_limit, junit_imports, junit_visibility, junit_forbidden
 
 
-def ollama_write_prompt(model: str, target: Dict, project_types_text: str, java_version: str) -> Dict:
-    pkg = target["package"] or "(default)"
-    cls = target["class_name"]
-    sig = target["signature"] or f"(entire class) {cls}"
-    imports_context = (
-        target.get("package_line") or "Imports unavailable from AST analyzer; use allowlist only."
-        if target.get("analysis_source") == "ast"
-        else extract_imports_context(target)
-    )
-    test_libraries = target.get("test_libraries") or {}
-    junit_version = str(test_libraries.get("junit", "5"))
-    has_mockito = bool(test_libraries.get("mockito", True))
-    (
-        framework_rule,
-        allowed_test_tools,
-        library_limit,
-        junit_imports,
-        junit_visibility,
-        junit_forbidden,
-    ) = _junit_prompt_rules(junit_version, has_mockito)
-    dependency_rule = (
-        "Create the class under test manually; mock only its dependencies."
-        if has_mockito
-        else "Create or call the class under test directly using real constructors/static methods and simple values."
-    )
+from demo.semantic.models import TestSpec
+from demo.prompter.rules import get_junit_prompt_rules, get_java_guidance
 
+def ollama_write_prompt(model: str, spec: TestSpec) -> Dict:
+    pkg = spec.package_name or "(default)"
+    cls = spec.class_name
+    sig = spec.signature or f"(entire class) {cls}"
+    
+    rules = get_junit_prompt_rules(spec.junit_version, spec.has_mockito)
+    java_guidance_text = get_java_guidance(spec.java_version)
+    
+    col_strategies = []
+    for col in spec.collaborator_strategy:
+        prefix = "Mock" if col.strategy == "mock" else "Use REAL object"
+        col_strategies.append(f"- {prefix} `{col.type_name}`: {col.details}")
+    col_strat_text = "\n".join(col_strategies) if col_strategies else "No specific collaborator strategies."
+    
+    cf = spec.control_flow_characteristics
+    cf_lines = []
+    if cf.get("has_loops"):
+        cf_lines.append("- Target has loops. Focus on testing loop bounds (0, 1, and multiple iterations).")
+    if cf.get("has_conditionals"):
+        cf_lines.append("- Target has conditional checks. Cover branches.")
+    if cf.get("has_exceptions"):
+        cf_lines.append("- Target can throw exceptions. Test validation failure and exception paths.")
+    cf_text = "\n".join(cf_lines) if cf_lines else "- Test typical cases and bounds."
+    
+    p_delegation_text = ""
+    if spec.private_method_delegation:
+        p_delegation_text = f"Target delegates to private methods: {', '.join(spec.private_method_delegation)}. Test these private helper paths indirectly through the public API."
+        
     class_mode_note = ""
-    if target.get("method_name") is None:
+    if spec.method_name is None:
         class_mode_note = (
             "If this is a framework wiring/config/filter class (e.g., Security filter, config), "
             "produce minimal unit tests focusing only on pure methods; do not reference servlet API types "
@@ -154,7 +159,7 @@ def ollama_write_prompt(model: str, target: Dict, project_types_text: str, java_
 
     sys = (
         "You are a senior Java testing expert. "
-        f"You write STRICT prompts for a code-generation model to produce JUnit {junit_version} unit tests."
+        f"You write STRICT prompts for a code-generation model to produce JUnit {spec.junit_version} unit tests."
     )
     user = f"""
 Return ONLY valid JSON with keys:
@@ -164,43 +169,45 @@ Return ONLY valid JSON with keys:
 Constraints for the generated test class:
 - Output MUST be ONLY Java code (no markdown, no explanations).
 - Start directly with the Java package/import/class declarations. Never include prose before or after the class.
-- Target Java language level: {java_version}. {java_version_guidance(java_version)}
-- Target test framework: JUnit {junit_version}. {junit_imports}
-- {junit_visibility}
-- {junit_forbidden}
-- {framework_rule}
+- Target Java language level: {spec.java_version}. {java_guidance_text}
+- Target test framework: JUnit {spec.junit_version}. {rules['junit_imports']}
+- {rules['junit_visibility']}
+- {rules['junit_forbidden']}
+- {rules['framework_rule']}
 - Do NOT use @SpringBootTest, MockMvc, WebMvcTest, SecurityMockMvcRequestPostProcessors, SpringExtension, or any Spring test utilities.
 - Do NOT use Spring test annotations (@SpringBootTest, etc.).
-- {library_limit}
-- Only use types that appear in the provided snippet/imports (plus {allowed_test_tools}).
+- {rules['library_limit']}
+- Only use types that appear in the provided snippet/imports.
 - Do not use Spring/Spring Security test utilities or types unless they already appear in the imports.
-- Use ONLY types already imported by the target class, plus {allowed_test_tools}. Do not introduce new application types (repositories/entities) unless they appear in the target source or imports.
+- Use ONLY types already imported by the target class. Do not introduce new application types (repositories/entities) unless they appear in the target source or imports.
 - Do NOT reference services/repositories unless they are imported in the target source OR appear in the snippet.
 - If the target is a Controller class and service types are not imported, do NOT create mocks for them; test only pure logic.
-- You may ONLY reference application types whose SIMPLE class name appears in the allowlist below.
 - Do not invent packages or class names (e.g., Entity vs Entities).
-- If a dependency type is not in imports/snippet/allowlist, avoid that test idea and write a simpler test.
-- {dependency_rule}
+- If a dependency type is not in imports/snippet, avoid that test idea and write a simpler test.
+- {rules['dependency_rule']}
 - Do NOT mock the class or method under test. Do NOT write tests that only assert Mockito stubs.
 - Every @Test method must execute at least one real production method from the target class or a concrete implementation of the target interface.
-- If the target type is an interface or abstract type, test a real concrete implementation from the allowlist/source context when available; otherwise do not use a mocked interface as the subject under test.
+- If the target type is an interface or abstract type, test a real concrete implementation from the source context when available; otherwise do not use a mocked interface as the subject under test.
 - Prefer simple real objects and constructors from the source code over Mockito. Use exact constructor signatures.
 - Use these imports exactly; do not use javax.* if project uses jakarta.*; do not invent missing dependencies.
 - Never use raw Object in Mockito stubbing; always return the exact declared return type.
-- Prefer real values for enums (e.g., Role.ADMIN) rather than mocks.
-- When dealing with Spring Security authorities, use Collection<? extends GrantedAuthority> (not List<GrantedAuthority>) unless the target method explicitly returns List.
-- Avoid overly specific generics; use Collection where appropriate.
+- Prefer real values for enums rather than mocks.
 - {class_mode_note}
 - At least 3 @Test methods with concrete assertions.
 - Name the test class exactly as you output in test_class_name.
 - The Java code inside the "prompt" field MUST declare: public class <test_class_name> using the exact test_class_name value from this JSON.
-- Only call methods and access fields that appear in the source snippet, related type sources, or allowlist. Do not invent getters/setters (e.g. getKey()) unless they exist in the provided source.
+- Only call methods and access fields that appear in the source snippet or related type sources. Do not invent getters/setters unless they exist in the provided source.
 - Do NOT call private methods from tests; use only public or protected entry points visible in the snippet.
 - For concrete classes, prefer constructing real instances (using constructors from the source) instead of mocking domain types.
-- When a method parameter is an interface and a concrete implementation exists in the allowlist (e.g. Item -> MyItem), pass real instances like `new MyItem(5)` — never mock interface methods with Mockito.
 - Access public fields directly when no getter exists (e.g. `item.key`, not `item.getKey()`).
-- Cover all branches: equal, less-than, and greater-than paths where the source has conditionals.
 - Place it in package: "{pkg}" if not default.
+
+Domain Kind classification: {spec.domain_kind}
+Control Flow characteristics:
+{cf_text}
+Private Method Delegation: {p_delegation_text or 'None.'}
+Collaborator Strategies:
+{col_strat_text}
 
 Target:
 - package: {pkg}
@@ -208,13 +215,13 @@ Target:
 - target: {sig}
 
 Package/imports context:
-{imports_context}
+{spec.imports_context}
 
 Source snippet:
-{target["snippet"]}
+{spec.snippet}
 
-Allowlist (project types):
-{project_types_text}
+Related type sources:
+{spec.related_sources}
 """.strip()
 
     return ollama_generate_json(model, user, sys)

@@ -46,6 +46,8 @@ from demo.llm.prompt_writer import (
     ollama_runtime_repair_test,
     ollama_write_prompt,
 )
+from demo.semantic import SemanticExtractor
+from demo.prompter import build_static_prompt
 from demo.llm.ollama import ollama_generate
 from demo.packages import (
     choose_packages_interactive,
@@ -674,28 +676,55 @@ def run_pipeline(args) -> None:
     project_types_text = "\n".join(project_type_context[:800]) or ", ".join(project_types[:800])
     generation_quality_log: List[Dict] = []
 
+    extractor = SemanticExtractor(ast_analysis or {})
+
     for i, t in enumerate(targets, 1):
-        g = ollama_write_prompt(args.gpt_model, t, project_types_text, java_version=project_java_version)
-
-        test_class = g.get("test_class_name", "")
-        test_class = ensure_unique_test_class_name(test_class, t, args.mode)
-        test_class = ensure_unique_run_class_name(test_class, used_test_class_names, i)
-        used_test_class_names.add(test_class)
-
-        test_target_map[test_class] = t
-
-        (demo_root / "prompts" / f"{test_class}.json").write_text(
-            json.dumps({"test_class_name": test_class, "prompt": g["prompt"]}, indent=2),
-            encoding="utf-8",
-        )
-
-        print(f"[{i}/{len(targets)}] Generating {test_class} ...")
+        # Determine related sources first so we can include it in the semantic extraction
         related_sources = (
             related_type_sources_from_analysis(ast_analysis, t)
             if ast_analysis is not None
             else collect_related_type_sources(project_root, t)
         )
-        base_prompt = g.get("prompt", "")
+
+        # Extract Semantic Spec
+        spec = extractor.extract_spec(
+            target=t,
+            java_version=project_java_version,
+            junit_version=junit_version,
+            has_mockito=has_mockito,
+            related_sources=related_sources
+        )
+
+        # Make test class name unique
+        test_class = spec.test_class_name
+        test_class = ensure_unique_run_class_name(test_class, used_test_class_names, i)
+        used_test_class_names.add(test_class)
+        spec.test_class_name = test_class
+
+        test_target_map[test_class] = t
+
+        # Save the distilled Spec JSON
+        (demo_root / "prompts" / f"{test_class}.spec.json").write_text(
+            json.dumps(spec.to_dict(), indent=2),
+            encoding="utf-8",
+        )
+
+        use_llm_prompter = getattr(args, "use_llm_prompter", False)
+        if use_llm_prompter:
+            print(f"[{i}/{len(targets)}] Using LLM prompt-writer for {test_class} ...")
+            g = ollama_write_prompt(args.gpt_model, spec)
+            base_prompt = g.get("prompt", "")
+        else:
+            print(f"[{i}/{len(targets)}] Using Static Prompter for {test_class} ...")
+            base_prompt = build_static_prompt(spec)
+
+        (demo_root / "prompts" / f"{test_class}.json").write_text(
+            json.dumps({"test_class_name": test_class, "prompt": base_prompt}, indent=2),
+            encoding="utf-8",
+        )
+
+        print(f"[{i}/{len(targets)}] Generating {test_class} ...")
+        base_prompt = base_prompt
         if looks_like_java_test_file(base_prompt):
             base_prompt = build_direct_generation_prompt(
                 target=t,
