@@ -8,29 +8,14 @@ from demo.config import GENERATED_PREFIX
 
 
 def parse_jacoco_xml(xml_path: Path) -> Dict[str, float]:
-    import xml.etree.ElementTree as ET
+    from demo.coverage.analyzer import CoverageAnalyzer
 
-    tree = ET.parse(str(xml_path))
-    root = tree.getroot()
-
-    def pct(covered: int, missed: int) -> float:
-        denom = covered + missed
-        return (covered / denom) if denom else 0.0
-
-    counters = {}
-    for c in root.findall("counter"):
-        typ = c.attrib.get("type")
-        covered = int(c.attrib.get("covered", "0"))
-        missed = int(c.attrib.get("missed", "0"))
-        counters[typ] = (covered, missed)
-
-    line_cov = pct(*counters.get("LINE", (0, 0)))
-    instr_cov = pct(*counters.get("INSTRUCTION", (0, 0)))
-    branch_cov = pct(*counters.get("BRANCH", (0, 0)))
+    project_root = xml_path.parents[3] if len(xml_path.parents) > 3 else xml_path.parent
+    analyzer = CoverageAnalyzer(xml_path=xml_path, project_root=project_root)
     return {
-        "line_coverage": line_cov,
-        "instruction_coverage": instr_cov,
-        "branch_coverage": branch_cov,
+        "line_coverage": analyzer.getLineCoverage(),
+        "instruction_coverage": analyzer.getInstructionCoverage(),
+        "branch_coverage": analyzer.getBranchCoverage(),
     }
 
 

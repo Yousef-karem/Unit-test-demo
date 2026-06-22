@@ -41,6 +41,7 @@ from demo.coverage.parse import (
     parse_surefire_reports,
     parse_surefire_summary,
 )
+from demo.coverage.refinement import CoverageRefinement
 from demo.llm.prompt_writer import (
     ollama_repair_test,
     ollama_runtime_repair_test,
@@ -1194,6 +1195,31 @@ def run_pipeline(args) -> None:
         # Always attempt report (even if some tests failed)
         report_log, report_rc = run_maven_report(project_root)
 
+        xml_after_runtime = project_root / "target" / "site" / "jacoco" / "jacoco.xml"
+        if test_rc == 0 and report_rc == 0 and xml_after_runtime.exists():
+            def coverage_related_sources(target: Dict) -> str:
+                return (
+                    related_type_sources_from_analysis(ast_analysis, target)
+                    if ast_analysis is not None
+                    else collect_related_type_sources(project_root, target)
+                )
+
+            refinement = CoverageRefinement(
+                project_root=project_root,
+                demo_root=demo_root,
+                model=args.ollama_model,
+                java_version=project_java_version,
+                junit_version=junit_version,
+                has_mockito=has_mockito,
+                ast_analysis=ast_analysis,
+                generated_paths=[p for p in generated_paths if Path(p).exists()],
+                test_target_map=test_target_map,
+                related_sources_provider=coverage_related_sources,
+                project_types_text=project_types_text,
+            )
+            refinement.run(xml_after_runtime)
+            generated_paths = [p for p in generated_paths if Path(p).exists()]
+
     # 8) Collect logs
     build_log = (test_log or "") + "\n" + (report_log or "")
     (demo_root / "coverage" / "build_log.txt").write_text(build_log, encoding="utf-8")
@@ -1225,7 +1251,12 @@ def run_pipeline(args) -> None:
         shutil.copyfile(xml_path, demo_root / "coverage" / "jacoco.xml")
 
     # Runtime counts
-    runtime_counts = parse_surefire_summary(test_log) if test_log else None
+    refinement_log_path = demo_root / "coverage_refinement" / "coverage_refinement_log.json"
+    runtime_counts = None
+    if refinement_log_path.exists():
+        runtime_counts = parse_surefire_reports(project_root / "target" / "surefire-reports")
+    if runtime_counts is None:
+        runtime_counts = parse_surefire_summary(test_log) if test_log else None
     if runtime_counts is None:
         runtime_counts = parse_surefire_reports(project_root / "target" / "surefire-reports") or {}
 
@@ -1249,6 +1280,14 @@ def run_pipeline(args) -> None:
         (demo_root / "coverage" / "quality_gate.txt").write_text(
             coverage_quality_issue, encoding="utf-8"
         )
+
+    coverage_refinement = None
+    refinement_log_path = demo_root / "coverage_refinement" / "coverage_refinement_log.json"
+    if refinement_log_path.exists():
+        try:
+            coverage_refinement = json.loads(refinement_log_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            coverage_refinement = None
 
     # No-report reason
     if not (report_dir / "index.html").exists():
@@ -1288,6 +1327,7 @@ def run_pipeline(args) -> None:
         "rejected_runtime_dir": str((demo_root / "rejected" / "runtime").resolve()),
         "jacoco_exec_found": jacoco_exec_found,
         "coverage": coverage,
+        "coverage_refinement": coverage_refinement,
         "coverage_quality_issue": coverage_quality_issue,
         "tests_run": runtime_counts.get("tests_run"),
         "failures": runtime_counts.get("failures"),

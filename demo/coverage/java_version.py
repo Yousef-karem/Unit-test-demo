@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 SUPPORTED_DOCKER_JAVA_VERSIONS = ("8", "11", "17", "21")
-FALLBACK_JAVA_VERSION = "8"
+FALLBACK_JAVA_VERSION = "17"
 
 _PROPERTY_PATTERNS = (
     r"<maven\.compiler\.release>\s*([^<\s]+)\s*</maven\.compiler\.release>",

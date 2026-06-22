@@ -11,7 +11,7 @@ from demo.config import (
     FALLBACK_JAVA_VERSION,
 )
 
-OFFICIAL_MAVEN_IMAGE_PREFIX = "maven:3.9-eclipse-temurin-"
+OFFICIAL_MAVEN_IMAGE_PREFIX = "maven:3.9.9-eclipse-temurin-"
 
 
 @dataclass(frozen=True)
