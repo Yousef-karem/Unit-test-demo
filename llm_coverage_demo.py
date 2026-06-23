@@ -38,6 +38,35 @@ def main() -> None:
         default=None,
         help="Optional classpath for AST symbol solving; if omitted, common target/build/lib jars are inferred",
     )
+    ap.add_argument(
+        "--analysis-threads",
+        type=int,
+        default=None,
+        help="Worker threads for AST analysis; defaults to available processors",
+    )
+    ap.add_argument(
+        "--analysis-shards-dir",
+        default=None,
+        help="Optional directory for package-sharded AST JSON output; defaults to DemoTestCases/<repo>-shards for each run",
+    )
+    ap.add_argument(
+        "--analysis-full-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also write/load one full analysis.json beside package shards (default: disabled)",
+    )
+    ap.add_argument(
+        "--analysis-batch-size",
+        type=int,
+        default=50,
+        help="Java files per AST worker batch inside each package (default: 50)",
+    )
+    ap.add_argument(
+        "--analysis-ast-tree",
+        choices=["none", "summary", "full"],
+        default="summary",
+        help="AST tree detail stored per method; summary is recommended for large projects",
+    )
     ap.add_argument("--packages", default=None, help='Comma-separated packages, or "ALL" (default). Example: com.app.service,com.app.util')
     ap.add_argument("--select-packages", action="store_true", help="Interactive multi-select packages")
     ap.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL)
