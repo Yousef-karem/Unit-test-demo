@@ -27,15 +27,9 @@ def run_ast_analysis(
     output_path: Path,
     analyzer_jar: Optional[Path] = None,
     classpath: Optional[str] = None,
-    output_dir: Optional[Path] = None,
-    threads: Optional[int] = None,
-    batch_size: Optional[int] = None,
-    ast_tree: Optional[str] = None,
-    full_output: bool = True,
 ) -> Dict:
     project_root = project_root.resolve()
     output_path = output_path.resolve()
-    output_dir = output_dir.resolve() if output_dir is not None else None
     jar = (analyzer_jar or default_analyzer_jar()).resolve()
     if not jar.exists():
         raise RuntimeError(
@@ -52,21 +46,12 @@ def run_ast_analysis(
         "full",
         "--project-root",
         str(project_root),
+        "--output",
+        str(output_path),
     ]
-    if full_output or output_dir is None:
-        cmd.extend(["--output", str(output_path)])
     cp = classpath or infer_project_classpath(project_root)
     if cp:
         cmd.extend(["--classpath", cp])
-    if output_dir is not None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        cmd.extend(["--output-dir", str(output_dir)])
-    if threads is not None and threads > 0:
-        cmd.extend(["--threads", str(threads)])
-    if batch_size is not None and batch_size > 0:
-        cmd.extend(["--batch-size", str(batch_size)])
-    if ast_tree:
-        cmd.extend(["--ast-tree", ast_tree])
 
     p = subprocess.run(cmd, cwd=str(project_root), text=True, capture_output=True)
     if p.returncode != 0:
@@ -76,40 +61,7 @@ def run_ast_analysis(
             f"STDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
         )
 
-    if output_dir is not None and not full_output:
-        return load_package_shards(output_dir)
     return json.loads(output_path.read_text(encoding="utf-8"))
-
-
-def load_package_shards(output_dir: Path) -> Dict:
-    manifest_path = output_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise RuntimeError(f"Package shard manifest not found: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    shards: List[Dict] = []
-    for item in manifest.get("packages") or []:
-        shard_file = output_dir / item.get("file", "")
-        if not shard_file.is_file():
-            continue
-        shard = json.loads(shard_file.read_text(encoding="utf-8"))
-        shards.append(
-            {
-                "packageName": item.get("packageName") or "",
-                "file": str(shard_file),
-                "analysis": shard,
-            }
-        )
-    call_graph_path = output_dir / (manifest.get("callGraphFile") or "call-graph.json")
-    call_graph = {}
-    if call_graph_path.is_file():
-        call_graph = json.loads(call_graph_path.read_text(encoding="utf-8"))
-    return {
-        "__sharded__": True,
-        "projectRoot": manifest.get("projectRoot"),
-        "manifest": manifest,
-        "callGraph": call_graph,
-        "packageShards": shards,
-    }
 
 
 def default_analyzer_jar() -> Path:
@@ -157,7 +109,7 @@ def targets_from_analysis(
     seen_files: set[str] = set()
     skip_keywords = ("application", "config", "filter", "security", "interceptor")
 
-    for fqcn, class_info, shard_file in iter_analysis_classes(analysis):
+    for fqcn, class_info in (analysis.get("classes") or {}).items():
         file_path = (class_info.get("filePath") or "").replace("\\", "/")
         if not file_path or file_path.startswith(JAVA_TEST_PREFIXES):
             continue
@@ -190,7 +142,6 @@ def targets_from_analysis(
                     "package_line": f"package {package};" if package else "",
                     "ast": {"class": class_info},
                     "analysis_source": "ast",
-                    "analysis_shard_file": shard_file,
                 }
             )
         else:
@@ -201,7 +152,6 @@ def targets_from_analysis(
                     signature=signature,
                     method_info=method_info,
                     source_file=source_file,
-                    shard_file=shard_file,
                 )
                 if target is None:
                     continue
@@ -213,17 +163,6 @@ def targets_from_analysis(
             break
 
     return targets
-
-
-def iter_analysis_classes(analysis: Dict) -> Iterable[Tuple[str, Dict, str]]:
-    if analysis.get("__sharded__"):
-        for shard in analysis.get("packageShards") or []:
-            shard_file = shard.get("file") or ""
-            for fqcn, class_info in ((shard.get("analysis") or {}).get("classes") or {}).items():
-                yield fqcn, class_info, shard_file
-        return
-    for fqcn, class_info in (analysis.get("classes") or {}).items():
-        yield fqcn, class_info, ""
 
 
 def split_fqcn(fqcn: str) -> Tuple[str, str]:
@@ -239,7 +178,6 @@ def target_from_method(
     signature: str,
     method_info: Dict,
     source_file: str,
-    shard_file: str = "",
 ) -> Dict | None:
     package, class_name = split_fqcn(fqcn)
     modifiers = (method_info.get("ast") or {}).get("modifiers") or []
@@ -267,7 +205,6 @@ def target_from_method(
         "package_line": f"package {package};" if package else "",
         "ast": ast,
         "analysis_source": "ast",
-        "analysis_shard_file": shard_file,
         "dependencies": (ast.get("dependencies") or {}),
     }
 
@@ -376,9 +313,9 @@ def compact_ast_tree(node: Optional[Dict], max_nodes: int, depth: int = 0) -> Li
     return lines
 
 
-def project_type_context_from_analysis(analysis: Dict, target: Optional[Dict] = None) -> List[str]:
+def project_type_context_from_analysis(analysis: Dict) -> List[str]:
     context: List[str] = []
-    for fqcn, class_info in context_classes_for_target(analysis, target):
+    for fqcn, class_info in (analysis.get("classes") or {}).items():
         if (class_info.get("filePath") or "").replace("\\", "/").startswith(JAVA_TEST_PREFIXES):
             continue
         _, name = split_fqcn(fqcn)
@@ -420,33 +357,12 @@ def related_type_sources_from_analysis(analysis: Dict, target: Dict) -> str:
         return ""
 
     chunks: List[str] = []
-    for fqcn, class_info in context_classes_for_target(analysis, target):
+    for fqcn, class_info in (analysis.get("classes") or {}).items():
         _, class_name = split_fqcn(fqcn)
         if class_name not in names or class_name == target.get("class_name"):
             continue
         chunks.append(class_ast_summary(fqcn, class_info))
     return "\n\n".join(chunks)
-
-
-def context_classes_for_target(analysis: Dict, target: Optional[Dict]) -> Iterable[Tuple[str, Dict]]:
-    if not analysis.get("__sharded__"):
-        for fqcn, class_info in (analysis.get("classes") or {}).items():
-            yield fqcn, class_info
-        return
-
-    target_package = (target or {}).get("package")
-    target_shard = (target or {}).get("analysis_shard_file")
-    referenced_simple_names = set(simple_names(type_names_from_target(target or {})))
-
-    for shard in analysis.get("packageShards") or []:
-        package_name = shard.get("packageName")
-        shard_file = shard.get("file") or ""
-        classes = (shard.get("analysis") or {}).get("classes") or {}
-        include_package = package_name == target_package or shard_file == target_shard
-        for fqcn, class_info in classes.items():
-            _, class_name = split_fqcn(fqcn)
-            if include_package or class_name in referenced_simple_names:
-                yield fqcn, class_info
 
 
 def type_names_from_target(target: Dict) -> Iterable[str]:
