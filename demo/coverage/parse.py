@@ -77,7 +77,7 @@ def extract_runtime_failures(reports_dir: Path) -> List[Dict[str, str]]:
         return []
     import xml.etree.ElementTree as ET
 
-    failures: Dict[str, str] = {}
+    failures: Dict[tuple[str, str], str] = {}
     for xml_path in reports_dir.glob("TEST-*.xml"):
         try:
             tree = ET.parse(str(xml_path))
@@ -86,6 +86,7 @@ def extract_runtime_failures(reports_dir: Path) -> List[Dict[str, str]]:
         root = tree.getroot()
         for case in root.findall(".//testcase"):
             classname = case.attrib.get("classname", "")
+            method_name = case.attrib.get("name", "")
             if GENERATED_PREFIX not in classname or not classname.endswith("Test"):
                 continue
             failure = case.find("failure")
@@ -94,6 +95,10 @@ def extract_runtime_failures(reports_dir: Path) -> List[Dict[str, str]]:
             if node is None:
                 continue
             text = (node.text or "").strip()
-            if classname not in failures:
-                failures[classname] = text
-    return [{"class_name": k, "stack_trace": v} for k, v in failures.items()]
+            key = (classname, method_name)
+            if key not in failures:
+                failures[key] = text
+    return [
+        {"class_name": class_name, "method_name": method_name, "stack_trace": stack_trace}
+        for (class_name, method_name), stack_trace in failures.items()
+    ]

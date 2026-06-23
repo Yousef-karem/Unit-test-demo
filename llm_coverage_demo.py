@@ -2,36 +2,85 @@ from __future__ import annotations
 
 import argparse
 
-from demo.config import DEFAULT_GPT_MODEL, DEFAULT_OLLAMA_MODEL
+from demo.config import (
+    DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
+    DEFAULT_DOCKER_MAVEN_IMAGE,
+    DEFAULT_GPT_MODEL,
+    DEFAULT_OLLAMA_MODEL,
+)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", required=False, help="GitHub URL or local project path")
+    ap.add_argument("--repo", default=None, help="GitHub URL or local project path")
     ap.add_argument(
-        "--generate-from-prompts",
+        "--from-run",
         default=None,
-        help="Path to an existing DemoTestCases folder; reads prompts/*.json and writes generated tests with Ollama",
+        help="Re-run JaCoCo coverage for an existing run without regenerating tests "
+        "(example: demo_out/09Ordenacao/runs/20260617_071517)",
     )
     ap.add_argument("--branch", default=None)
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
     ap.add_argument("--build", choices=["auto", "maven", "gradle"], default="auto")
+    ap.add_argument(
+        "--analysis-mode",
+        choices=["ast", "source"],
+        default="ast",
+        help="Use static analyzer AST JSON for targets/context, or legacy source regex extraction",
+    )
+    ap.add_argument(
+        "--analyzer-jar",
+        default=None,
+        help="Path to testnexus-analyzer fat JAR; defaults to ./testnexus-analyzer-1.0.0.jar",
+    )
+    ap.add_argument(
+        "--analysis-classpath",
+        default=None,
+        help="Optional classpath for AST symbol solving; if omitted, common target/build/lib jars are inferred",
+    )
     ap.add_argument("--packages", default=None, help='Comma-separated packages, or "ALL" (default). Example: com.app.service,com.app.util')
     ap.add_argument("--select-packages", action="store_true", help="Interactive multi-select packages")
     ap.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL)
-    ap.add_argument("--gpt-model", default=DEFAULT_GPT_MODEL)
+    ap.add_argument("--gpt-model", default=DEFAULT_GPT_MODEL, help="Local Ollama model to write prompts and perform repairs (defaults to qwen2.5-coder:7b)")
     ap.add_argument("--max-files", type=int, default=10, help="Safety limit for demo; increase if you want")
     ap.add_argument("--max-targets", type=int, default=50, help="Safety limit for demo; increase if you want")
+    ap.add_argument(
+        "--max-refinement-iterations",
+        type=int,
+        default=5,
+        help="Maximum LLM repair attempts per generated test during compile/runtime refinement",
+    )
     ap.add_argument(
         "--skip-framework-classes",
         default=True,
         action=argparse.BooleanOptionalAction,
         help="Skip classes likely to be framework wiring (default: enabled)",
     )
+    ap.add_argument(
+        "--docker-maven",
+        action="store_true",
+        help="Run Maven compile/test/coverage inside a Docker container (pinned JDK/Maven)",
+    )
+    ap.add_argument(
+        "--docker-maven-image",
+        default=DEFAULT_DOCKER_MAVEN_IMAGE,
+        help="Override Docker image for Maven (default: maven:3.9-eclipse-temurin-<java-version>)",
+    )
+    ap.add_argument(
+        "--docker-maven-cache-volume",
+        default=DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
+        help="Named Docker volume for Maven .m2 cache (default: llm-coverage-maven-cache)",
+    )
     args = ap.parse_args()
-    if not args.repo and not args.generate_from_prompts:
-        ap.error("--repo is required unless --generate-from-prompts is provided")
+    if args.from_run:
+        if args.repo:
+            ap.error("Use either --from-run or --repo, not both.")
+        from demo.coverage_rerun import run_coverage_from_run
 
+        run_coverage_from_run(args)
+        return
+    if not args.repo:
+        ap.error("--repo is required unless --from-run is provided.")
     from demo.pipeline import run_pipeline
 
     run_pipeline(args)

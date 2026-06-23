@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import torch
 from dotenv import load_dotenv
-from openai import OpenAI
 from transformers import AutoModel, AutoTokenizer
 
 from demo.packages import PACKAGE_RE, list_java_files
@@ -26,7 +25,7 @@ load_dotenv()
 # -------------------------
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
-DEFAULT_GPT_MODEL = "gpt-5.2"  # update if your account uses a different id
+DEFAULT_GPT_MODEL = "qwen2.5-coder:7b"  # update if your account uses a different id
 GENERATED_PREFIX = "LLM_Generated"
 
 CODEBERT_MODEL = "microsoft/codebert-base"
@@ -106,9 +105,9 @@ def list_project_types(project_root: Path) -> List[str]:
 # -------------------------
 # GPT prompt-writer (OpenAI Responses API)
 # -------------------------
-def gpt_make_prompt(client: OpenAI, gpt_model: str, method: Dict, project_types_text: str) -> Dict:
+def ollama_make_prompt(model: str, method: Dict, project_types_text: str) -> Dict:
     """
-    GPT writes a strict generation prompt for the code model.
+    Ollama writes a strict generation prompt for the code model.
     We require JSON output to keep it deterministic.
     """
     sys = (
@@ -146,18 +145,43 @@ Allowlist (project types):
 {project_types_text}
 """.strip()
 
-    # OpenAI recommends Responses API as the modern interface. :contentReference[oaicite:1]{index=1}
-    resp = client.responses.create(
-        model=gpt_model,
-        input=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user},
-        ],
-        # Ask for JSON only; we'll parse strictly.
-        response_format={"type": "json_object"},
-    )
-    text = resp.output_text.strip()
-    return json.loads(text)
+    payload = {
+        "model": model,
+        "prompt": user,
+        "system": sys,
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 2200},
+    }
+    r = requests.post(OLLAMA_URL, json=payload, timeout=240)
+    r.raise_for_status()
+    resp_text = (r.json().get("response") or "").strip()
+    
+    def _extract_first_json_object(text: str) -> Dict:
+        text = text.strip()
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+        start = text.find("{")
+        if start == -1:
+            raise ValueError("No JSON object found in model output.")
+        depth = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i+1])
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Invalid JSON object found: {e}")
+        raise ValueError("Unterminated JSON object in model output.")
+        
+    return _extract_first_json_object(resp_text)
 
 # -------------------------
 # Ollama generation (LLaMA/Qwen local)
@@ -369,9 +393,6 @@ def main():
     project_types = list_project_types(project_root)
     project_types_text = ", ".join(project_types[:800])
 
-    # OpenAI client reads OPENAI_API_KEY from env (recommended) :contentReference[oaicite:2]{index=2}
-    client = OpenAI()
-
     embedder = CodeBertEmbedder()
 
     java_files = list_java_files(project_root)[: args.max_files]
@@ -385,7 +406,7 @@ def main():
         methods = extract_methods(jf, args.max_methods_per_file)
         for method in methods:
             # 1) GPT writes the prompt
-            gpt_out = gpt_make_prompt(client, args.gpt_model, method, project_types_text)
+            gpt_out = ollama_make_prompt(args.gpt_model, method, project_types_text)
             gpt_out["test_class_name"] = ensure_unique_test_class_name(gpt_out.get("test_class_name", ""), method)
 
             prompt_path = OUT_DIR / "prompts" / f"{Path(method['source_file']).stem}_{method['method_name']}.json"

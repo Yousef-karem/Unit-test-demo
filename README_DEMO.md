@@ -1,6 +1,6 @@
 # LLM Unit Test + Coverage Demo (GPT Prompting → Ollama Codegen → JaCoCo)
 
-This project is a **demo tool** that generates **JUnit 5 unit tests** for any Java project (Maven or Gradle), then runs **JaCoCo coverage** **using ONLY the generated tests** to measure their quality.
+This project is a **demo tool** that generates **JUnit unit tests** (JUnit 4 or 5, detected from the target project) for any Java Maven project, then runs **JaCoCo coverage** **using ONLY the generated tests** to measure their quality.
 
 ## High-level pipeline
 
@@ -37,9 +37,10 @@ You get JaCoCo metrics:
 ### System requirements
 - Python 3.10+
 - Git
-- Java (JDK 17+ recommended)
-- Maven and/or Gradle (depending on target project)
+- Java (JDK 17+ recommended) — optional when using `--docker-maven`
+- Maven and/or Gradle (depending on target project) — Maven optional when using `--docker-maven`
 - Ollama installed and running locally
+- Docker (optional) — for pinned JDK/Maven via `--docker-maven`
 
 ### Python dependencies
 Install and activate a venv:
@@ -81,6 +82,41 @@ Or create a `.env` file in the same folder as `llm_coverage_demo.py`:
 ```env
 OPENAI_API_KEY=YOUR_KEY
 ```
+
+### Docker Maven (optional, hybrid mode)
+
+Python and Ollama stay on the host. Only Maven compile/test/coverage runs inside Docker for a consistent JDK/Maven toolchain.
+
+By default, the pipeline reads the target project's root `pom.xml` and uses that Java version for **LLM prompt generation, test codegen, repairs, and Docker Maven** (Docker coerces to supported image tags `8/11/17/21`). Docker pulls the matching official image on first use — no manual build required.
+
+Run with Docker Maven:
+
+```bash
+python llm_coverage_demo.py \
+  --repo "<YOUR_REPO_URL_OR_PATH>" \
+  --mode method \
+  --docker-maven
+```
+
+Useful flags:
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--docker-maven` | off | Enable Docker for Maven stages |
+| `--docker-maven-image` | auto | Override full image name |
+| `--docker-maven-cache-volume` | `llm-coverage-maven-cache` | Persistent Maven `.m2` cache |
+
+**Java version detection** scans the root `pom.xml` for (in order): `maven.compiler.release`, `java.version`, `maven.compiler.source`, then `maven-compiler-plugin` `release`/`source`. The detected version is injected into prompt writer, test codegen, and compile/runtime repair prompts. Properties inherited only from a parent POM are not resolved. Unsupported Docker JDK tags fall back to Java 17 for the container image only.
+
+**Optional custom image:** build [`docker/maven/Dockerfile`](docker/maven/Dockerfile) and pass `--docker-maven-image llm-coverage-maven:17` for air-gapped or pinned environments.
+
+**Performance note:** Docker improves reproducibility (JDK/Maven version, isolated `.m2`), not end-to-end speed. LLM generation still dominates runtime. First Docker run may be slower until the Maven cache volume warms up.
+
+**Paths with spaces:** The cloned repo is mounted with its absolute path. Paths like `/media/user/New Volume/...` are supported.
+
+**JUnit detection:** Reads `pom.xml` / Gradle files for `junit:junit` (JUnit 4) or `junit-jupiter` (JUnit 5). If unclear, scans existing `src/test/java` imports. Defaults to JUnit 5 when still unknown. Legacy dataset projects with JUnit 4 in the pom will generate JUnit 4 tests.
+
+**Related issue:** JUnit alignment does not fix legacy projects whose pom has no Java version (Maven defaults to Java 5 on JDK 17). Use `--docker-maven` with a Java 8 image or add `maven.compiler.source/target` to the pom.
 
 ---
 
@@ -126,7 +162,8 @@ GPT writes a strict JSON response:
 
 The prompt enforces:
 
-* JUnit 5 + Mockito only
+* JUnit 4 or JUnit 5 (auto-detected from pom/gradle and existing tests)
+* Mockito only when the project already depends on it
 * No Spring Boot test framework
 * No inventing missing dependencies
 * Prefer concrete assertions
@@ -344,12 +381,23 @@ The tool:
 * attempts runtime repair
 * moves unrecoverable tests into `rejected/runtime/`
 
+### 4) Docker Maven errors
+
+| Symptom | Fix |
+|---------|-----|
+| `Docker was not found on PATH` | Install Docker or drop `--docker-maven` |
+| `Unable to find image 'maven:3.9-eclipse-temurin-21'` | Run `docker pull maven:3.9-eclipse-temurin-21` (or the version shown in the log) |
+| Wrong Java version in generated tests | Add `java.version` to child `pom.xml` if it is only defined in a parent POM |
+| Properties only in parent POM | Duplicate `java.version` in child pom so detection and LLM prompts see it |
+| Permission denied on `/var/run/docker.sock` | Add your user to the `docker` group |
+| Slow first run | Normal — Maven downloads dependencies into the cache volume |
+
 ---
 
 ## Notes / Limitations
 
 * This tool is designed for  **unit tests** , not integration tests.
-* It uses **JUnit 5 + Mockito only** by design (to keep the evaluation consistent).
+* It generates tests with the **JUnit version detected from the target project** (4 or 5), plus Mockito only when already present
 * It does **not commit or push** anything into the target repo.
 * JaCoCo coverage here measures how much code was executed by the generated tests — it does not guarantee correctness.
 
@@ -393,7 +441,8 @@ Below is what **each option/flag does**, and how it affects generation + coverag
 **What it does:** Selects the target Java project to analyze and generate tests for.
 **Accepts:**
 
-* GitHub URL (e.g., `https://github.com/user/repo.git`)
+* GitHub repo URL (e.g., `https://github.com/user/repo.git`)
+* GitHub folder URL (e.g., `https://github.com/user/repo/tree/main/subproject`) — clones the repo, checks out the branch, and uses that subfolder as the project root
 * Local path (e.g., `/home/youssef/projects/MyApp`)
 
 **What happens:**
@@ -530,6 +579,23 @@ A “target” means:
 
 ---
 
+### `--max-refinement-iterations`
+
+**What it does:** Sets how many times the feedback loop may repair a generated test after compile or runtime failure.
+
+**Example:**
+
+```bash
+--max-refinement-iterations 5
+```
+
+**Impact:**
+
+* Higher value → more CubeTester-style refinement attempts
+* Lower value → faster runs with more rejected tests
+
+---
+
 ### `--packages`
 
 **What it does:** Restricts generation to specific packages only.
@@ -594,7 +660,7 @@ mvn -q -Dtest=LLM_Generated*Test test-compile
 
 If compilation fails:
 
-* GPT tries to repair the failing file
+* GPT tries to repair the failing file up to `--max-refinement-iterations`
 * unrepaired tests are moved to `DemoTestCases/rejected/compile/`
 
 ### Maven (runtime + coverage stage)
@@ -608,7 +674,7 @@ mvn -q org.jacoco:jacoco-maven-plugin:0.8.12:report
 
 If runtime errors occur:
 
-* GPT tries runtime repairs
+* GPT tries runtime repairs up to `--max-refinement-iterations`
 * unrepaired tests are moved to `DemoTestCases/rejected/runtime/`
 
 ### Gradle (coverage stage)
@@ -639,4 +705,10 @@ python llm_coverage_demo.py --repo "<repo>" --mode method --max-files 40 --max-t
 
 ```bash
 python llm_coverage_demo.py --repo "<repo>" --mode method --packages "com.myapp.service,com.myapp.util"
+```
+
+### Reproducible Maven (Docker, auto Java version)
+
+```bash
+python llm_coverage_demo.py --repo "<repo>" --mode method --docker-maven --max-files 40 --max-targets 300
 ```
