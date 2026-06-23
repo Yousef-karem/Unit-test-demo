@@ -592,11 +592,21 @@ def run_pipeline(args) -> None:
     if analysis_mode == "ast":
         analysis_path = demo_root / "analysis.json"
         analyzer_jar = Path(args.analyzer_jar) if getattr(args, "analyzer_jar", None) else None
+        analysis_shards_dir = (
+            Path(args.analysis_shards_dir).resolve()
+            if getattr(args, "analysis_shards_dir", None)
+            else demo_root / f"{repo_name}-shards"
+        )
         ast_analysis = run_ast_analysis(
             project_root=project_root,
             output_path=analysis_path,
             analyzer_jar=analyzer_jar,
             classpath=getattr(args, "analysis_classpath", None),
+            output_dir=analysis_shards_dir,
+            threads=getattr(args, "analysis_threads", None),
+            batch_size=getattr(args, "analysis_batch_size", None),
+            ast_tree=getattr(args, "analysis_ast_tree", None),
+            full_output=getattr(args, "analysis_full_output", True),
         )
         targets = targets_from_analysis(
             analysis=ast_analysis,
@@ -665,16 +675,16 @@ def run_pipeline(args) -> None:
     used_test_class_names: set[str] = set()
 
     project_types = list_project_types(project_root)
-    project_type_context = (
-        project_type_context_from_analysis(ast_analysis)
-        if ast_analysis is not None
-        else list_project_type_context(project_root)
-    )
-    # Keep the context bounded (avoid huge prompts)
-    project_types_text = "\n".join(project_type_context[:800]) or ", ".join(project_types[:800])
     generation_quality_log: List[Dict] = []
 
     for i, t in enumerate(targets, 1):
+        project_type_context = (
+            project_type_context_from_analysis(ast_analysis, t)
+            if ast_analysis is not None
+            else list_project_type_context(project_root)
+        )
+        # Keep prompt context package-local when sharded, and bounded either way.
+        project_types_text = "\n".join(project_type_context[:250]) or ", ".join(project_types[:250])
         g = ollama_write_prompt(args.gpt_model, t, project_types_text, java_version=project_java_version)
 
         test_class = g.get("test_class_name", "")
