@@ -214,6 +214,14 @@ class CoverageRefinement:
         for test_path, methods in list(groups.items())[:3]:
             target = self.test_target_map.get(test_path.stem, {})
             prompt = self._build_prompt(iteration, test_path, target, methods[:6], coverage)
+
+            prompt_path = (
+                self.demo_root
+                / "coverage_refinement"
+                / f"iteration_{iteration}_prompt.txt"
+            )
+            prompt_path.write_text(prompt, encoding="utf-8")
+            
             methods_code = self._sanitize_methods(ollama_generate(self.model, prompt))
             if not methods_code.strip():
                 continue
