@@ -9,7 +9,7 @@ import re
 from demo.config import (
     DEFAULT_COVERAGE_REFINEMENT_METRICS,
     DEFAULT_COVERAGE_THRESHOLD,
-    DEFAULT_MAX_COVERAGE_REFINEMENTS,
+    DEFAULT_MAX_ITERATION_REFINEMENTS,
     DEFAULT_MAX_STAGNATION_ITERATIONS,
 )
 from demo.coverage.analyzer import CoverageAnalyzer, UncoveredMethod
@@ -37,7 +37,7 @@ class CoverageRefinement:
         project_types_text: str,
         threshold: float = DEFAULT_COVERAGE_THRESHOLD,
         metrics: Tuple[str, ...] = DEFAULT_COVERAGE_REFINEMENT_METRICS,
-        max_iterations: int = DEFAULT_MAX_COVERAGE_REFINEMENTS,
+        max_iterations: int = DEFAULT_MAX_ITERATION_REFINEMENTS,
         max_stagnation: int = DEFAULT_MAX_STAGNATION_ITERATIONS,
     ):
         self.project_root = project_root
