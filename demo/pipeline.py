@@ -5,16 +5,21 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional, Set
 
 
 
 from demo.config import (
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
+    DEFAULT_GENERATION_THREADS,
     DEMO_OUT,
     GENERATED_PATTERN,
     GENERATED_PREFIX,
@@ -513,194 +518,75 @@ Project type context:
 """.strip()
 
 
-# ----------------------------
-# Pipeline
-# ----------------------------
+@dataclass
+class TargetGenerationResult:
+    index: int
+    test_class: str
+    target: Dict
+    out_path: Optional[str] = None
+    quality_log_entry: Optional[Dict] = None
+    error: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
 
-def run_pipeline(args) -> None:
-    # 1) Per-repo run root + clone/open repo
-    DEMO_OUT.mkdir(exist_ok=True)
-    repo_name = repo_name_from_arg(args.repo)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_root = DEMO_OUT / repo_name / "runs" / timestamp
-    run_root.mkdir(parents=True, exist_ok=True)
-    project_root = clone_or_update(args.repo, run_root / "repo", args.branch)
-    if patch_obsolete_tools_jar_dependency(project_root):
-        print("Patched obsolete com.sun:tools/tools.jar dependency for modern JDK compatibility.")
 
-    demo_root = run_root / "DemoTestCases"
-    (demo_root / "prompts").mkdir(parents=True, exist_ok=True)
-    (demo_root / "generated").mkdir(parents=True, exist_ok=True)
-    (demo_root / "coverage").mkdir(parents=True, exist_ok=True)
-    (demo_root / "failures").mkdir(parents=True, exist_ok=True)
-    (demo_root / "compile").mkdir(parents=True, exist_ok=True)
-    (demo_root / "runtime").mkdir(parents=True, exist_ok=True)
-    (demo_root / "rejected" / "compile").mkdir(parents=True, exist_ok=True)
-    (demo_root / "rejected" / "runtime").mkdir(parents=True, exist_ok=True)
-    rejected_compile_root = demo_root / "rejected" / "compile"
-    max_refinement_iterations = max(0, int(getattr(args, "max_refinement_iterations", 5)))
+def _elapsed_since(start: float) -> float:
+    return round(time.perf_counter() - start, 2)
 
-    # 2) Detect build system
-    build = args.build
-    if build == "auto":
-        build = detect_build_system(project_root)
-    if build != "maven":
-        raise RuntimeError("This demo pipeline.py currently supports Maven repos only (pom.xml).")
 
-    use_docker_maven = getattr(args, "docker_maven", False)
-    project_java_version = resolve_project_java_version(project_root)
-    docker_java_version = coerce_supported_version(project_java_version)
-    pom_java_version = detect_java_version(project_root)
-    compiler_java_version = project_java_version if pom_java_version is None else None
-    docker_image = getattr(args, "docker_maven_image", None) or DEFAULT_DOCKER_MAVEN_IMAGE
-    maven_cache_volume = getattr(args, "docker_maven_cache_volume", DEFAULT_DOCKER_MAVEN_CACHE_VOLUME)
-    configure_maven_runner(
-        use_docker=use_docker_maven,
-        java_version=docker_java_version,
-        docker_image=docker_image,
-        maven_cache_volume=maven_cache_volume,
-        compiler_java_version=compiler_java_version,
-    )
-    if use_docker_maven:
-        ensure_docker_available()
-        print(
-            "Using Docker Maven image:",
-            docker_image_name(),
-            f"(Java {docker_java_version}, project Java {project_java_version}, cache volume: {maven_cache_volume})",
-        )
-    else:
-        print(f"Detected project Java version: {project_java_version}")
-    if compiler_java_version:
-        print(
-            f"Maven compiler properties will use Java {compiler_java_version} "
-            "(pom.xml has no explicit Java version)."
-        )
+def _print_timing_summary(timing: Dict) -> None:
+    threads = timing.get("generation_threads", 1)
+    targets = timing.get("target_count", 0)
+    print("\nTiming (seconds):")
+    print(f"  Setup:              {timing.get('setup_seconds', 0):.2f}")
+    print(f"  Analysis:           {timing.get('analysis_seconds', 0):.2f}")
+    print(f"  Generation:        {timing.get('generation_seconds', 0):.2f}  ({threads} threads, {targets} targets)")
+    print(f"  Compile/repair:    {timing.get('compile_repair_seconds', 0):.2f}")
+    print(f"  Runtime/coverage:  {timing.get('runtime_coverage_seconds', 0):.2f}")
+    print(f"  Total:            {timing.get('total_seconds', 0):.2f}")
 
-    junit_version = detect_junit_version(project_root)
-    print(f"Detected JUnit version: {junit_version}")
 
-    # 3) Discover packages
-    pkgs = discover_packages(project_root)
-    selected: List[str] = ["*"]
-    if args.select_packages:
-        selected = choose_packages_interactive(pkgs)
-    elif args.packages and args.packages.strip().upper() != "ALL":
-        selected = [p.strip() for p in args.packages.split(",") if p.strip()] or ["*"]
-
-    # 4) Collect targets
-    analysis_mode = getattr(args, "analysis_mode", "ast")
-    ast_analysis: Dict | None = None
-    if analysis_mode == "ast":
-        analysis_path = demo_root / "analysis.json"
-        analyzer_jar = Path(args.analyzer_jar) if getattr(args, "analyzer_jar", None) else None
-        analysis_shards_dir = (
-            Path(args.analysis_shards_dir).resolve()
-            if getattr(args, "analysis_shards_dir", None)
-            else demo_root / f"{repo_name}-shards"
-        )
-        ast_analysis = run_ast_analysis(
-            project_root=project_root,
-            output_path=analysis_path,
-            analyzer_jar=analyzer_jar,
-            classpath=getattr(args, "analysis_classpath", None),
-            output_dir=analysis_shards_dir,
-            threads=getattr(args, "analysis_threads", None),
-            batch_size=getattr(args, "analysis_batch_size", None),
-            ast_tree=getattr(args, "analysis_ast_tree", None),
-            full_output=getattr(args, "analysis_full_output", True),
-        )
-        targets = targets_from_analysis(
-            analysis=ast_analysis,
-            project_root=project_root,
-            mode=args.mode,
-            selected_packages=selected,
-            max_files=args.max_files,
-            max_targets=args.max_targets,
-            skip_framework_classes=args.skip_framework_classes,
-        )
-    else:
-        java_files = list_java_files(project_root)
-        java_files = [f for f in java_files if file_in_selected_packages(f, project_root, selected)]
-
-        targets: List[Dict] = []
-        skip_keywords = ("application", "config", "filter", "security", "interceptor")
-        scanned_files = 0
-        for f in java_files:
-            scanned_files += 1
-            for t in extract_targets(f, args.mode):
-                if args.skip_framework_classes:
-                    cls_name = (t.get("class_name") or "").lower()
-                    if any(k in cls_name for k in skip_keywords):
-                        continue
-                if is_interface_target(t):
-                    continue
-                targets.append(t)
-                if len(targets) >= args.max_targets:
-                    break
-            if len(targets) >= args.max_targets:
-                break
-            if scanned_files >= args.max_files and targets:
-                break
-
-    if not targets:
-        raise RuntimeError("No targets found (check src/main/java and selected packages).")
-
-    has_mockito = project_has_mockito(project_root)
-    for t in targets:
-        t["test_libraries"] = {
-            "junit": junit_version,
-            "mockito": has_mockito,
-        }
-
-    # Save config and target list for reproducibility
-    config = {
-        "args": vars(args),
-        "resolved_java_version": project_java_version,
-        "docker_java_version": docker_java_version,
-        "maven_compiler_java_version": compiler_java_version,
-        "resolved_junit_version": junit_version,
-        "selected_packages": selected,
-        "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
-        "analysis_mode": analysis_mode,
-        "max_refinement_iterations": max_refinement_iterations,
-        "test_libraries": {"junit": junit_version, "mockito": has_mockito},
-    }
-    (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    (demo_root / "targets.json").write_text(json.dumps(targets, indent=2), encoding="utf-8")
-
-    # 5) Ollama writes prompts; Ollama generates tests; write into repo
-    load_env_file(Path(__file__).resolve().parents[1] / ".env")
-
-    generated_paths: List[str] = []
-    test_target_map: Dict[str, Dict] = {}
-    used_test_class_names: set[str] = set()
-
-    project_types = list_project_types(project_root)
-    generation_quality_log: List[Dict] = []
-
-    for i, t in enumerate(targets, 1):
+def _generate_one_target(
+    *,
+    index: int,
+    total: int,
+    t: Dict,
+    args,
+    project_root: Path,
+    demo_root: Path,
+    rejected_compile_root: Path,
+    ast_analysis,
+    project_java_version: str,
+    junit_version: str,
+    has_mockito: bool,
+    project_types: List[str],
+    used_test_class_names: Set[str],
+    name_lock: threading.Lock,
+    print_lock: threading.Lock,
+) -> TargetGenerationResult:
+    worker_start = time.perf_counter()
+    try:
         project_type_context = (
             project_type_context_from_analysis(ast_analysis, t)
             if ast_analysis is not None
             else list_project_type_context(project_root)
         )
-        # Keep prompt context package-local when sharded, and bounded either way.
         project_types_text = "\n".join(project_type_context[:250]) or ", ".join(project_types[:250])
         g = ollama_write_prompt(args.gpt_model, t, project_types_text, java_version=project_java_version)
 
         test_class = g.get("test_class_name", "")
         test_class = ensure_unique_test_class_name(test_class, t, args.mode)
-        test_class = ensure_unique_run_class_name(test_class, used_test_class_names, i)
-        used_test_class_names.add(test_class)
-
-        test_target_map[test_class] = t
+        with name_lock:
+            test_class = ensure_unique_run_class_name(test_class, used_test_class_names, index)
+            used_test_class_names.add(test_class)
 
         (demo_root / "prompts" / f"{test_class}.json").write_text(
             json.dumps({"test_class_name": test_class, "prompt": g["prompt"]}, indent=2),
             encoding="utf-8",
         )
 
-        print(f"[{i}/{len(targets)}] Generating {test_class} ...")
+        with print_lock:
+            print(f"[{index}/{total}] Generating {test_class} ...")
+
         related_sources = (
             related_type_sources_from_analysis(ast_analysis, t)
             if ast_analysis is not None
@@ -773,18 +659,283 @@ def run_pipeline(args) -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(code, encoding="utf-8")
             (dest.with_suffix(".txt")).write_text(invalid_reason, encoding="utf-8")
-            generation_quality_log.append(
-                {
+            elapsed = _elapsed_since(worker_start)
+            return TargetGenerationResult(
+                index=index,
+                test_class=test_class,
+                target=t,
+                quality_log_entry={
                     "test_class": test_class,
                     "target": t,
                     "reason": invalid_reason,
                     "action": "rejected_invalid_generation",
-                }
+                    "elapsed_seconds": elapsed,
+                },
+                elapsed_seconds=elapsed,
             )
-            continue
 
         out_path = write_test_file(project_root, t["package"], test_class, code)
-        generated_paths.append(str(out_path))
+        return TargetGenerationResult(
+            index=index,
+            test_class=test_class,
+            target=t,
+            out_path=str(out_path),
+            elapsed_seconds=_elapsed_since(worker_start),
+        )
+    except Exception as exc:
+        return TargetGenerationResult(
+            index=index,
+            test_class="",
+            target=t,
+            error=str(exc),
+            elapsed_seconds=_elapsed_since(worker_start),
+        )
+
+
+# ----------------------------
+# Pipeline
+# ----------------------------
+
+def run_pipeline(args) -> None:
+    run_started = time.perf_counter()
+    started_at = datetime.now().isoformat(timespec="seconds")
+    stage_started = run_started
+    timing: Dict[str, float] = {}
+
+    # 1) Per-repo run root + clone/open repo
+    DEMO_OUT.mkdir(exist_ok=True)
+    repo_name = repo_name_from_arg(args.repo)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_root = DEMO_OUT / repo_name / "runs" / timestamp
+    run_root.mkdir(parents=True, exist_ok=True)
+    project_root = clone_or_update(args.repo, run_root / "repo", args.branch)
+    if patch_obsolete_tools_jar_dependency(project_root):
+        print("Patched obsolete com.sun:tools/tools.jar dependency for modern JDK compatibility.")
+
+    demo_root = run_root / "DemoTestCases"
+    (demo_root / "prompts").mkdir(parents=True, exist_ok=True)
+    (demo_root / "generated").mkdir(parents=True, exist_ok=True)
+    (demo_root / "coverage").mkdir(parents=True, exist_ok=True)
+    (demo_root / "failures").mkdir(parents=True, exist_ok=True)
+    (demo_root / "compile").mkdir(parents=True, exist_ok=True)
+    (demo_root / "runtime").mkdir(parents=True, exist_ok=True)
+    (demo_root / "rejected" / "compile").mkdir(parents=True, exist_ok=True)
+    (demo_root / "rejected" / "runtime").mkdir(parents=True, exist_ok=True)
+    rejected_compile_root = demo_root / "rejected" / "compile"
+    max_refinement_iterations = max(0, int(getattr(args, "max_refinement_iterations", 5)))
+
+    # 2) Detect build system
+    build = args.build
+    if build == "auto":
+        build = detect_build_system(project_root)
+    if build != "maven":
+        raise RuntimeError("This demo pipeline.py currently supports Maven repos only (pom.xml).")
+
+    use_docker_maven = getattr(args, "docker_maven", False)
+    project_java_version = resolve_project_java_version(project_root)
+    docker_java_version = coerce_supported_version(project_java_version)
+    pom_java_version = detect_java_version(project_root)
+    compiler_java_version = project_java_version if pom_java_version is None else None
+    docker_image = getattr(args, "docker_maven_image", None) or DEFAULT_DOCKER_MAVEN_IMAGE
+    maven_cache_volume = getattr(args, "docker_maven_cache_volume", DEFAULT_DOCKER_MAVEN_CACHE_VOLUME)
+    configure_maven_runner(
+        use_docker=use_docker_maven,
+        java_version=docker_java_version,
+        docker_image=docker_image,
+        maven_cache_volume=maven_cache_volume,
+        compiler_java_version=compiler_java_version,
+    )
+    if use_docker_maven:
+        ensure_docker_available()
+        print(
+            "Using Docker Maven image:",
+            docker_image_name(),
+            f"(Java {docker_java_version}, project Java {project_java_version}, cache volume: {maven_cache_volume})",
+        )
+    else:
+        print(f"Detected project Java version: {project_java_version}")
+    if compiler_java_version:
+        print(
+            f"Maven compiler properties will use Java {compiler_java_version} "
+            "(pom.xml has no explicit Java version)."
+        )
+
+    junit_version = detect_junit_version(project_root)
+    print(f"Detected JUnit version: {junit_version}")
+
+    # 3) Discover packages
+    pkgs = discover_packages(project_root)
+    selected: List[str] = ["*"]
+    if args.select_packages:
+        selected = choose_packages_interactive(pkgs)
+    elif args.packages and args.packages.strip().upper() != "ALL":
+        selected = [p.strip() for p in args.packages.split(",") if p.strip()] or ["*"]
+
+    timing["setup_seconds"] = _elapsed_since(stage_started)
+    stage_started = time.perf_counter()
+
+    # 4) Collect targets
+    analysis_mode = getattr(args, "analysis_mode", "ast")
+    ast_analysis: Dict | None = None
+    if analysis_mode == "ast":
+        analysis_path = demo_root / "analysis.json"
+        analyzer_jar = Path(args.analyzer_jar) if getattr(args, "analyzer_jar", None) else None
+        analysis_shards_dir = (
+            Path(args.analysis_shards_dir).resolve()
+            if getattr(args, "analysis_shards_dir", None)
+            else demo_root / f"{repo_name}-shards"
+        )
+        ast_analysis = run_ast_analysis(
+            project_root=project_root,
+            output_path=analysis_path,
+            analyzer_jar=analyzer_jar,
+            classpath=getattr(args, "analysis_classpath", None),
+            output_dir=analysis_shards_dir,
+            threads=getattr(args, "analysis_threads", None),
+            batch_size=getattr(args, "analysis_batch_size", None),
+            ast_tree=getattr(args, "analysis_ast_tree", None),
+            full_output=getattr(args, "analysis_full_output", True),
+        )
+        targets = targets_from_analysis(
+            analysis=ast_analysis,
+            project_root=project_root,
+            mode=args.mode,
+            selected_packages=selected,
+            max_files=args.max_files,
+            max_targets=args.max_targets,
+            skip_framework_classes=args.skip_framework_classes,
+        )
+    else:
+        java_files = list_java_files(project_root)
+        java_files = [f for f in java_files if file_in_selected_packages(f, project_root, selected)]
+
+        targets: List[Dict] = []
+        skip_keywords = ("application", "config", "filter", "security", "interceptor")
+        scanned_files = 0
+        for f in java_files:
+            scanned_files += 1
+            for t in extract_targets(f, args.mode):
+                if args.skip_framework_classes:
+                    cls_name = (t.get("class_name") or "").lower()
+                    if any(k in cls_name for k in skip_keywords):
+                        continue
+                if is_interface_target(t):
+                    continue
+                targets.append(t)
+                if len(targets) >= args.max_targets:
+                    break
+            if len(targets) >= args.max_targets:
+                break
+            if scanned_files >= args.max_files and targets:
+                break
+
+    if not targets:
+        raise RuntimeError("No targets found (check src/main/java and selected packages).")
+
+    timing["analysis_seconds"] = _elapsed_since(stage_started)
+    stage_started = time.perf_counter()
+
+    has_mockito = project_has_mockito(project_root)
+    for t in targets:
+        t["test_libraries"] = {
+            "junit": junit_version,
+            "mockito": has_mockito,
+        }
+
+    # Save config and target list for reproducibility
+    config = {
+        "args": vars(args),
+        "resolved_java_version": project_java_version,
+        "docker_java_version": docker_java_version,
+        "maven_compiler_java_version": compiler_java_version,
+        "resolved_junit_version": junit_version,
+        "selected_packages": selected,
+        "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
+        "analysis_mode": analysis_mode,
+        "max_refinement_iterations": max_refinement_iterations,
+        "test_libraries": {"junit": junit_version, "mockito": has_mockito},
+    }
+    (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (demo_root / "targets.json").write_text(json.dumps(targets, indent=2), encoding="utf-8")
+
+    # 5) Ollama writes prompts; Ollama generates tests; write into repo
+    load_env_file(Path(__file__).resolve().parents[1] / ".env")
+
+    generated_paths: List[str] = []
+    test_target_map: Dict[str, Dict] = {}
+    used_test_class_names: set[str] = set()
+
+    project_types = list_project_types(project_root)
+    project_types_text = (
+        "\n".join(list_project_type_context(project_root)[:250])
+        or ", ".join(project_types[:250])
+    )
+    generation_quality_log: List[Dict] = []
+
+    generation_threads = max(
+        1,
+        getattr(args, "generation_threads", DEFAULT_GENERATION_THREADS) or DEFAULT_GENERATION_THREADS,
+    )
+    name_lock = threading.Lock()
+    print_lock = threading.Lock()
+    total_targets = len(targets)
+    generation_elapsed: List[float] = []
+
+    with ThreadPoolExecutor(max_workers=generation_threads) as pool:
+        futures = [
+            pool.submit(
+                _generate_one_target,
+                index=i,
+                total=total_targets,
+                t=t,
+                args=args,
+                project_root=project_root,
+                demo_root=demo_root,
+                rejected_compile_root=rejected_compile_root,
+                ast_analysis=ast_analysis,
+                project_java_version=project_java_version,
+                junit_version=junit_version,
+                has_mockito=has_mockito,
+                project_types=project_types,
+                used_test_class_names=used_test_class_names,
+                name_lock=name_lock,
+                print_lock=print_lock,
+            )
+            for i, t in enumerate(targets, 1)
+        ]
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result.elapsed_seconds is not None:
+                generation_elapsed.append(result.elapsed_seconds)
+            if result.error:
+                generation_quality_log.append(
+                    {
+                        "test_class": result.test_class or f"target_{result.index}",
+                        "target": result.target,
+                        "reason": result.error,
+                        "action": "generation_exception",
+                        "elapsed_seconds": result.elapsed_seconds,
+                    }
+                )
+                with print_lock:
+                    print(f"[{result.index}/{total_targets}] Generation failed: {result.error}")
+                continue
+            if result.test_class:
+                test_target_map[result.test_class] = result.target
+            if result.quality_log_entry:
+                generation_quality_log.append(result.quality_log_entry)
+            elif result.out_path:
+                generated_paths.append(result.out_path)
+
+    timing["generation_seconds"] = _elapsed_since(stage_started)
+    if generation_elapsed:
+        timing["generation_seconds_avg"] = round(sum(generation_elapsed) / len(generation_elapsed), 2)
+        timing["generation_seconds_max"] = round(max(generation_elapsed), 2)
+    print(
+        f"\nGeneration finished in {timing['generation_seconds']:.2f}s "
+        f"({generation_threads} threads, {total_targets} targets)"
+    )
+    stage_started = time.perf_counter()
 
     written_paths = list(generated_paths)
     (demo_root / "written_paths.json").write_text(json.dumps(written_paths, indent=2), encoding="utf-8")
@@ -1020,6 +1171,9 @@ def run_pipeline(args) -> None:
     compile_rejected_files = list((demo_root / "rejected" / "compile").rglob(f"{GENERATED_PREFIX}*Test.java"))
     compile_rejected = len(compile_rejected_files)
 
+    timing["compile_repair_seconds"] = _elapsed_since(stage_started)
+    stage_started = time.perf_counter()
+
     early_stop = (compile_survivors == 0) or compile_blocked
 
     # 7) Runtime stage: run tests with JaCoCo agent; runtime repair on failures
@@ -1230,6 +1384,8 @@ def run_pipeline(args) -> None:
             refinement.run(xml_after_runtime)
             generated_paths = [p for p in generated_paths if Path(p).exists()]
 
+    timing["runtime_coverage_seconds"] = _elapsed_since(stage_started)
+
     # 8) Collect logs
     build_log = (test_log or "") + "\n" + (report_log or "")
     (demo_root / "coverage" / "build_log.txt").write_text(build_log, encoding="utf-8")
@@ -1312,6 +1468,16 @@ def run_pipeline(args) -> None:
             reason = "coverage report not found"
         (demo_root / "coverage" / "no_report_reason.txt").write_text(reason, encoding="utf-8")
 
+    timing["total_seconds"] = _elapsed_since(run_started)
+    finished_at = datetime.now().isoformat(timespec="seconds")
+    timing_summary = {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "generation_threads": generation_threads,
+        "target_count": total_targets,
+        **timing,
+    }
+
     summary = {
         "repo": args.repo,
         "project_root": str(project_root),
@@ -1347,6 +1513,7 @@ def run_pipeline(args) -> None:
         if (report_dir / "index.html").exists()
         else None,
         "note": "Tests were written locally into src/test/java but NOT committed or pushed.",
+        "timing": timing_summary,
     }
     (demo_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -1365,3 +1532,5 @@ def run_pipeline(args) -> None:
         print(f"- Line:        {coverage['line_coverage']*100:.2f}%")
         print(f"- Instruction: {coverage['instruction_coverage']*100:.2f}%")
         print(f"- Branch:      {coverage['branch_coverage']*100:.2f}%")
+
+    _print_timing_summary(timing_summary)
