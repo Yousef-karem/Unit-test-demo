@@ -20,6 +20,8 @@ from demo.config import (
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
     DEFAULT_GENERATION_THREADS,
+    DEFAULT_MAX_ITERATION_REFINEMENTS,
+
     DEMO_OUT,
     GENERATED_PATTERN,
     GENERATED_PREFIX,
@@ -722,7 +724,10 @@ def run_pipeline(args) -> None:
     (demo_root / "rejected" / "compile").mkdir(parents=True, exist_ok=True)
     (demo_root / "rejected" / "runtime").mkdir(parents=True, exist_ok=True)
     rejected_compile_root = demo_root / "rejected" / "compile"
-    max_refinement_iterations = max(0, int(getattr(args, "max_refinement_iterations", 5)))
+    max_refinement_iterations = max(
+        0,
+        int(getattr(args, "max_refinement_iterations", DEFAULT_MAX_ITERATION_REFINEMENTS)),
+    )
 
     # 2) Detect build system
     build = args.build

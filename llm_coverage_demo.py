@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 
 from demo.config import (
+    DEFAULT_COVERAGE_REFINEMENT_METRICS,
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
     DEFAULT_GENERATION_THREADS,
     DEFAULT_GPT_MODEL,
+    DEFAULT_MAX_ITERATION_REFINEMENTS,
     DEFAULT_OLLAMA_MODEL,
 )
 
@@ -83,7 +85,7 @@ def main() -> None:
     ap.add_argument(
         "--max-refinement-iterations",
         type=int,
-        default=5,
+        default=DEFAULT_MAX_ITERATION_REFINEMENTS,
         help="Maximum LLM repair attempts per generated test during compile/runtime refinement",
     )
     ap.add_argument(
