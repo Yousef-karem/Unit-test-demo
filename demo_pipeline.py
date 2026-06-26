@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,6 +18,12 @@ import torch
 from dotenv import load_dotenv
 from transformers import AutoModel, AutoTokenizer
 
+from demo.config import (
+    DEFAULT_GENERATION_THREADS,
+    DEFAULT_GPT_MODEL,
+    DEFAULT_OLLAMA_MODEL,
+    GENERATED_PREFIX,
+)
 from demo.packages import PACKAGE_RE, list_java_files
 
 load_dotenv()
@@ -24,10 +32,6 @@ load_dotenv()
 # Config
 # -------------------------
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
-DEFAULT_GPT_MODEL = "qwen2.5-coder:7b"  # update if your account uses a different id
-GENERATED_PREFIX = "LLM_Generated"
-
 CODEBERT_MODEL = "microsoft/codebert-base"
 MOD = 998244353
 
@@ -378,11 +382,63 @@ class ItemResult:
     test_path: str
     validation: Dict
 
+
+@dataclass
+class LlmGenerationResult:
+    method: Dict
+    gpt_out: Dict
+    test_code: str
+    index: int
+    error: Optional[str] = None
+
+
+def _generate_llm_for_method(
+    *,
+    index: int,
+    total: int,
+    method: Dict,
+    gpt_model: str,
+    ollama_model: str,
+    project_types_text: str,
+    print_lock: threading.Lock,
+) -> LlmGenerationResult:
+    try:
+        gpt_out = ollama_make_prompt(gpt_model, method, project_types_text)
+        gpt_out["test_class_name"] = ensure_unique_test_class_name(gpt_out.get("test_class_name", ""), method)
+
+        prompt_path = OUT_DIR / "prompts" / f"{Path(method['source_file']).stem}_{method['method_name']}.json"
+        prompt_path.write_text(json.dumps(gpt_out, indent=2), encoding="utf-8")
+
+        test_code = ollama_generate(ollama_model, gpt_out["prompt"])
+
+        gen_path = OUT_DIR / "generated" / f"{gpt_out['test_class_name']}.java"
+        gen_path.write_text(test_code, encoding="utf-8")
+
+        with print_lock:
+            print(f"[{index}/{total}] Generated artifacts for {method['class_name']}.{method['method_name']}")
+
+        return LlmGenerationResult(method=method, gpt_out=gpt_out, test_code=test_code, index=index)
+    except Exception as exc:
+        return LlmGenerationResult(
+            method=method,
+            gpt_out={},
+            test_code="",
+            index=index,
+            error=str(exc),
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project-root", required=True, help="Path to Maven project (has pom.xml)")
     ap.add_argument("--gpt-model", default=DEFAULT_GPT_MODEL)
     ap.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL)
+    ap.add_argument(
+        "--generation-threads",
+        type=int,
+        default=DEFAULT_GENERATION_THREADS,
+        help="Worker threads for parallel prompt/test generation (default: GENERATION_THREADS env or 3)",
+    )
     ap.add_argument("--max-files", type=int, default=5)
     ap.add_argument("--max-methods-per-file", type=int, default=2)
     ap.add_argument("--min-score", type=float, default=3.0)
@@ -400,35 +456,60 @@ def main():
         print("No Java files found under src/main/java")
         return
 
-    results: List[ItemResult] = []
-
+    work_items: List[Dict] = []
     for jf in java_files:
-        methods = extract_methods(jf, args.max_methods_per_file)
-        for method in methods:
-            # 1) GPT writes the prompt
-            gpt_out = ollama_make_prompt(args.gpt_model, method, project_types_text)
-            gpt_out["test_class_name"] = ensure_unique_test_class_name(gpt_out.get("test_class_name", ""), method)
+        for method in extract_methods(jf, args.max_methods_per_file):
+            work_items.append(method)
 
-            prompt_path = OUT_DIR / "prompts" / f"{Path(method['source_file']).stem}_{method['method_name']}.json"
-            prompt_path.write_text(json.dumps(gpt_out, indent=2), encoding="utf-8")
+    if not work_items:
+        print("No methods found to generate tests for")
+        return
 
-            # 2) Ollama generates the test code
-            test_code = ollama_generate(args.ollama_model, gpt_out["prompt"])
+    results: List[ItemResult] = []
+    generation_threads = max(1, args.generation_threads or DEFAULT_GENERATION_THREADS)
+    print_lock = threading.Lock()
+    total_items = len(work_items)
+    llm_results: List[LlmGenerationResult] = []
 
-            # Save raw generated test in demo_out as well
-            gen_path = OUT_DIR / "generated" / f"{gpt_out['test_class_name']}.java"
-            gen_path.write_text(test_code, encoding="utf-8")
+    with ThreadPoolExecutor(max_workers=generation_threads) as pool:
+        futures = [
+            pool.submit(
+                _generate_llm_for_method,
+                index=i,
+                total=total_items,
+                method=method,
+                gpt_model=args.gpt_model,
+                ollama_model=args.ollama_model,
+                project_types_text=project_types_text,
+                print_lock=print_lock,
+            )
+            for i, method in enumerate(work_items, 1)
+        ]
+        for fut in as_completed(futures):
+            llm_results.append(fut.result())
 
-            # 3) Validate
-            val = validate_with_codebert(embedder, method, test_code)
-            if val["score"] < args.min_score:
-                continue
+    llm_results.sort(key=lambda r: r.index)
 
-            # 4) Write into project so Maven/JaCoCo can run
-            test_path = write_test_to_project(project_root, method, test_code, gpt_out["test_class_name"])
+    for item in llm_results:
+        if item.error:
+            with print_lock:
+                print(f"[{item.index}/{total_items}] Generation failed: {item.error}")
+            continue
 
-            results.append(ItemResult(method=method, gpt=gpt_out, test_path=str(test_path), validation=val))
-            print(f"Generated: {test_path} | score={val['score']:.3f} sim={val['similarity']:.3f}")
+        val = validate_with_codebert(embedder, item.method, item.test_code)
+        if val["score"] < args.min_score:
+            continue
+
+        test_path = write_test_to_project(
+            project_root, item.method, item.test_code, item.gpt_out["test_class_name"]
+        )
+
+        results.append(
+            ItemResult(method=item.method, gpt=item.gpt_out, test_path=str(test_path), validation=val)
+        )
+        print(
+            f"Generated: {test_path} | score={val['score']:.3f} sim={val['similarity']:.3f}"
+        )
 
     coverage = {}
     if args.run_coverage and results:
