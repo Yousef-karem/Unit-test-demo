@@ -6,6 +6,7 @@ from demo.config import (
     DEFAULT_COVERAGE_REFINEMENT_METRICS,
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
+    DEFAULT_GENERATION_THREADS,
     DEFAULT_GPT_MODEL,
     DEFAULT_MAX_ITERATION_REFINEMENTS,
     DEFAULT_OLLAMA_MODEL,
@@ -73,6 +74,12 @@ def main() -> None:
     ap.add_argument("--select-packages", action="store_true", help="Interactive multi-select packages")
     ap.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL)
     ap.add_argument("--gpt-model", default=DEFAULT_GPT_MODEL, help="Local Ollama model to write prompts and perform repairs (defaults to qwen2.5-coder:7b)")
+    ap.add_argument(
+        "--generation-threads",
+        type=int,
+        default=DEFAULT_GENERATION_THREADS,
+        help="Worker threads for parallel prompt/test generation (default: GENERATION_THREADS env or 3)",
+    )
     ap.add_argument("--max-files", type=int, default=10, help="Safety limit for demo; increase if you want")
     ap.add_argument("--max-targets", type=int, default=50, help="Safety limit for demo; increase if you want")
     ap.add_argument(
