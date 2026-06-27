@@ -41,6 +41,15 @@ def repo_name_from_arg(repo: str) -> str:
     if is_github_url(repo):
         return safe_name(github_repo_label(repo))
     p = Path(repo).expanduser().resolve()
+    parts = p.parts
+    for i, part in enumerate(parts):
+        if (
+            part == "demo_out"
+            and i + 3 < len(parts)
+            and parts[i + 2] == "runs"
+            and parts[-1] == "repo"
+        ):
+            return safe_name(parts[i + 1])
     return safe_name(p.name)
 
 
