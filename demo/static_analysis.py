@@ -261,10 +261,13 @@ def target_from_method(
         "package": package,
         "class_name": class_name,
         "method_name": method_name,
+        "signature_key": signature,
         "signature": java_signature,
         "snippet": method_ast_summary(fqcn, signature, method_info),
         "source_file": source_file,
         "package_line": f"package {package};" if package else "",
+        "start_line": method_info.get("startLine"),
+        "end_line": method_info.get("endLine"),
         "ast": ast,
         "analysis_source": "ast",
         "analysis_shard_file": shard_file,
@@ -414,16 +417,57 @@ def project_type_context_from_analysis(analysis: Dict, target: Optional[Dict] = 
     return sorted(context)
 
 
-def related_type_sources_from_analysis(analysis: Dict, target: Dict) -> str:
+def read_class_source_snippet(class_info: Dict, project_root: Path, max_lines: int = 120) -> str:
+    file_path = class_info.get("filePath")
+    if not file_path:
+        return ""
+    source_path = project_root / file_path
+    try:
+        text = source_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[:max_lines]) + "\n// ... truncated ..."
+
+
+def _domain_kind_label(class_info: Dict) -> str:
+    return (class_info.get("domainKind") or "general").lower()
+
+
+def related_type_sources_from_analysis(
+    analysis: Dict,
+    target: Dict,
+    project_root: Path | None = None,
+) -> str:
+    deps = target.get("dependencies") or {}
     names = set(simple_names(type_names_from_target(target)))
+    uses = set(simple_names(deps.get("usesTypes") or []))
+    if uses:
+        filtered = {n for n in names if n in uses}
+        if filtered:
+            names = filtered
     if not names:
         return ""
+
+    root = project_root
+    if root is None:
+        root_path = analysis.get("projectRoot")
+        if root_path:
+            root = Path(root_path)
 
     chunks: List[str] = []
     for fqcn, class_info in context_classes_for_target(analysis, target):
         _, class_name = split_fqcn(fqcn)
         if class_name not in names or class_name == target.get("class_name"):
             continue
+        domain = _domain_kind_label(class_info)
+        if root and domain in ("entity", "dto"):
+            source = read_class_source_snippet(class_info, root)
+            if source.strip():
+                chunks.append(f"// source: {class_info.get('filePath', fqcn)}\n{source}")
+                continue
         chunks.append(class_ast_summary(fqcn, class_info))
     return "\n\n".join(chunks)
 

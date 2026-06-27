@@ -7,6 +7,7 @@ from demo.config import (
     DEFAULT_DOCKER_MAVEN_IMAGE,
     DEFAULT_GENERATION_THREADS,
     DEFAULT_GPT_MODEL,
+    DEFAULT_PROMPT_MODE,
     DEFAULT_MAX_ITERATION_REFINEMENTS,
     DEFAULT_MAX_STAGNATION_ITERATIONS,
     DEFAULT_OLLAMA_MODEL,
@@ -25,6 +26,12 @@ def main() -> None:
     )
     ap.add_argument("--branch", default=None)
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
+    ap.add_argument(
+        "--prompt-mode",
+        choices=["llm", "static"],
+        default=DEFAULT_PROMPT_MODE,
+        help="Prompt generation strategy: llm (LLM meta-prompt) or static (AST semantic prompt builder)",
+    )
     ap.add_argument("--build", choices=["auto", "maven", "gradle"], default="auto")
     ap.add_argument(
         "--analysis-mode",
@@ -132,9 +139,12 @@ def main() -> None:
         return
     if not args.repo:
         ap.error("--repo is required unless --from-run is provided.")
-    from demo.pipeline import run_pipeline
+    if args.prompt_mode == "static" and args.analysis_mode != "ast":
+        ap.error("Static prompt mode requires --analysis-mode ast")
+    from demo.prompt_generation.factory import create_prompt_generator
+    from demo.pipeline import Pipeline
 
-    run_pipeline(args)
+    Pipeline(create_prompt_generator(args)).run(args)
 
 
 if __name__ == "__main__":
