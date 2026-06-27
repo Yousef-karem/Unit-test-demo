@@ -22,6 +22,7 @@ class StaticPromptGenerator:
             junit_version=context.junit_version,
             has_mockito=context.has_mockito,
             related_sources=related,
+            project_root=context.project_root,
         )
         prompt = build_static_prompt(spec)
         return PromptResult(

@@ -76,7 +76,7 @@ def resolve_related_sources(
     target: Dict,
 ) -> str:
     if ast_analysis is not None:
-        return related_type_sources_from_analysis(ast_analysis, target)
+        return related_type_sources_from_analysis(ast_analysis, target, project_root=project_root)
     return collect_related_type_sources(project_root, target)
 
 

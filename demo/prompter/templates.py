@@ -34,6 +34,12 @@ TARGET UNDER TEST:
 - Domain Role: {domain_kind}
 - Target: {signature}
 
+{imports_guidance}
+
+{testability_guidance}
+
+{assertion_strategy}
+
 SOURCE CODE SNIPPET:
 {snippet}
 
