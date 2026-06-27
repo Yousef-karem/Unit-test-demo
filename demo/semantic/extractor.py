@@ -4,6 +4,13 @@ import re
 from pathlib import Path
 from typing import Dict, List, Any, Set
 
+from demo.semantic.context_enricher import (
+    enrich_imports_context,
+    enrich_method_source,
+    enrich_private_method_sources,
+    extract_literal_outputs,
+)
+from demo.semantic.edge_cases import build_edge_case_guidance
 from demo.semantic.models import TestSpec, CollaboratorStrategy
 
 # List of common value/utility types that should never be mocked
@@ -25,7 +32,15 @@ class SemanticExtractor:
         self.analysis = analysis or {}
         self.classes = self.analysis.get("classes") or {}
 
-    def extract_spec(self, target: Dict, java_version: str = "17", junit_version: str = "5", has_mockito: bool = True, related_sources: str = "") -> TestSpec:
+    def extract_spec(
+        self,
+        target: Dict,
+        java_version: str = "17",
+        junit_version: str = "5",
+        has_mockito: bool = True,
+        related_sources: str = "",
+        project_root: Path | None = None,
+    ) -> TestSpec:
         package = target.get("package") or ""
         class_name = target.get("class_name") or ""
         method_name = target.get("method_name")
@@ -57,6 +72,10 @@ class SemanticExtractor:
                     break
                     
         ast_dict = method_info.get("ast", {})
+        modifiers = ast_dict.get("modifiers") or []
+        return_type = method_info.get("returnType") or "void"
+        is_static = "static" in modifiers
+        is_void = return_type == "void"
         
         # Testability Hints
         testability_hints = self._extract_testability_hints(domain_kind, ast_dict)
@@ -106,6 +125,11 @@ class SemanticExtractor:
         
         # 5. Private Method Delegation
         private_method_delegation = self._extract_private_delegation(fqcn, class_info, dependencies_calls)
+        private_method_sources = enrich_private_method_sources(
+            class_info,
+            private_method_delegation,
+            target.get("source_file"),
+        )
         
         # 6. Collaborator Strategy
         collaborator_strategy = self._extract_collaborator_strategy(fqcn, class_info, uses_types, method_info)
@@ -128,6 +152,17 @@ class SemanticExtractor:
                 if fqcn in impls or class_name in impls or fqcn == extends or class_name == extends:
                     concrete_implementations.append(c_fqcn)
                     
+        method_source = enrich_method_source(
+            target,
+            class_info,
+            method_info,
+            fqcn,
+            sig_key or "",
+        )
+        literal_outputs = extract_literal_outputs(ast_dict, method_source)
+        imports_context = enrich_imports_context(target)
+        edge_case_guidance = build_edge_case_guidance(method_info, control_flow_characteristics)
+
         return TestSpec(
             package_name=package,
             class_name=class_name,
@@ -137,6 +172,9 @@ class SemanticExtractor:
             java_version=java_version,
             junit_version=junit_version,
             has_mockito=has_mockito,
+            return_type=return_type,
+            is_static=is_static,
+            is_void=is_void,
             domain_kind=domain_kind,
             testability_hints=testability_hints,
             dependencies_calls=dependencies_calls,
@@ -145,9 +183,13 @@ class SemanticExtractor:
             private_method_delegation=private_method_delegation,
             collaborator_strategy=collaborator_strategy,
             snippet=target.get("snippet") or "",
-            imports_context=target.get("package_line") or f"package {package};" if package else "",
+            method_source=method_source,
+            imports_context=imports_context,
             constructor_sigs=constructor_sigs,
-            related_sources=related_sources
+            related_sources=related_sources,
+            private_method_sources=private_method_sources,
+            literal_outputs=literal_outputs,
+            edge_case_guidance=edge_case_guidance,
         )
 
     def _stable_suffix_for_target(self, t: Dict) -> str:
