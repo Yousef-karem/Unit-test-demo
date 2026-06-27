@@ -21,11 +21,12 @@ from typing import Dict, Iterator, List, Optional, Set
 
 
 from demo.config import (
+    DEFAULT_COVERAGE_THRESHOLD,
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
     DEFAULT_GENERATION_THREADS,
     DEFAULT_MAX_ITERATION_REFINEMENTS,
-
+    DEFAULT_MAX_STAGNATION_ITERATIONS,
     DEMO_OUT,
     GENERATED_PATTERN,
     GENERATED_PREFIX,
@@ -54,6 +55,7 @@ from demo.coverage.parse import (
 )
 from demo.coverage.refinement import CoverageRefinement
 from demo.llm.prompt_writer import (
+    OllamaRepairTimeout,
     ollama_repair_test,
     ollama_runtime_repair_test,
 )
@@ -267,10 +269,40 @@ def isolate_non_generated_test_files(
         except OSError:
             resolved = test_file
 
-        # Keep generated tests in place.
-        if resolved in generated_set or test_file.name.startswith(GENERATED_PREFIX):
+        # Keep only this run's generated tests in place.
+        if resolved in generated_set:
             continue
 
+        rel = test_file.relative_to(test_root)
+        dest = backup_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(test_file), str(dest))
+        moved.append({"from": str(test_file), "to": str(dest)})
+
+    return moved
+
+
+def isolate_stale_generated_tests(
+    project_root: Path, keep_paths: List[str], backup_root: Path
+) -> List[Dict[str, str]]:
+    """
+    Move LLM_Generated*Test.java files left over from prior runs that are not
+    part of the current run's generated_paths.
+    """
+    test_root = project_root / "src" / "test" / "java"
+    if not test_root.exists():
+        return []
+
+    keep_set = {Path(p).resolve() for p in keep_paths}
+    moved: List[Dict[str, str]] = []
+
+    for test_file in test_root.rglob(f"{GENERATED_PREFIX}*Test.java"):
+        try:
+            resolved = test_file.resolve()
+        except OSError:
+            resolved = test_file
+        if resolved in keep_set:
+            continue
         rel = test_file.relative_to(test_root)
         dest = backup_root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -296,8 +328,8 @@ def isolate_generated_tests_except(
 ) -> Iterator[List[Dict[str, str]]]:
     """
     Temporarily move every generated test except keep_path out of src/test/java.
-    This mirrors CubeTester-style focused refinement: compiler/runtime logs should
-    describe the specific generated test being repaired, not unrelated failures.
+    Temporarily isolate other generated tests so compiler/runtime logs refer only
+    to the specific generated test being repaired, not unrelated failures.
     """
     test_root = project_root / "src" / "test" / "java"
     moved: List[Dict[str, str]] = []
@@ -346,6 +378,86 @@ def concise_error_log(log: str, max_lines: int = 80) -> str:
     ]
     selected = important or lines
     return "\n".join(selected[-max_lines:])
+
+
+def concise_compile_error_log(log: str, failing_path: Path, max_lines: int = 30) -> str:
+    """Extract compile errors scoped to a specific test file for shorter repair prompts."""
+    log = strip_ansi(log)
+    needle = failing_path.name
+    scoped = [line for line in log.splitlines() if needle in line or "[ERROR]" in line]
+    if not scoped:
+        scoped = [
+            line
+            for line in log.splitlines()
+            if "[ERROR]" in line or "cannot find symbol" in line or "error:" in line.lower()
+        ]
+    selected = scoped or log.splitlines()
+    return "\n".join(selected[-max_lines:])
+
+
+def concise_runtime_error_log(
+    log_or_trace: str,
+    class_name: str = "",
+    method_name: str = "",
+    max_lines: int = 30,
+) -> str:
+    """Extract Surefire failure details for a specific test method."""
+    log = strip_ansi(log_or_trace)
+    lines = log.splitlines()
+    if not class_name and not method_name:
+        return concise_error_log(log, max_lines=max_lines)
+
+    simple_class = class_name.rsplit(".", 1)[-1] if class_name else ""
+    selected: List[str] = []
+    capture = False
+    for line in lines:
+        if method_name and (
+            f"{simple_class}.{method_name}" in line
+            or (">>> FAILURE!" in line and method_name in line)
+        ):
+            capture = True
+        elif simple_class and simple_class in line and (
+            "FAILURE" in line or "ERROR" in line or "Exception" in line
+        ):
+            capture = True
+        if capture:
+            selected.append(line)
+            if len(selected) >= max_lines:
+                break
+    if not selected:
+        selected = [
+            line
+            for line in lines
+            if "AssertionError" in line
+            or "Exception" in line
+            or "Failed tests:" in line
+            or "FAILURE" in line
+        ]
+    return "\n".join((selected or lines)[-max_lines:])
+
+
+def count_passed_generated_tests(reports_dir: Path) -> int:
+    """Count passing test cases in LLM_Generated* Surefire reports."""
+    if not reports_dir.exists():
+        return 0
+    import xml.etree.ElementTree as ET
+
+    passed = 0
+    for xml_path in reports_dir.glob("TEST-*.xml"):
+        if GENERATED_PREFIX not in xml_path.name:
+            continue
+        try:
+            tree = ET.parse(str(xml_path))
+        except ET.ParseError:
+            continue
+        root = tree.getroot()
+        for case in root.findall(".//testcase"):
+            classname = case.attrib.get("classname", "")
+            if GENERATED_PREFIX not in classname:
+                continue
+            if case.find("failure") is None and case.find("error") is None:
+                passed += 1
+    return passed
 
 
 def resolve_maven_test_path(project_root: Path, reported_path: Path) -> Path:
@@ -654,6 +766,7 @@ def _generate_one_target(
         code = ""
         invalid_reason = ""
         out_path: Optional[Path] = None
+        use_generation_compile_gate = not getattr(args, "skip_generation_compile_gate", True)
         source_bundle = f"{related_sources}\n{t.get('snippet') or ''}"
         for attempt in range(3):
             code = sanitize_java_output(ollama_generate(args.ollama_model, prompt_text))
@@ -672,11 +785,13 @@ def _generate_one_target(
                     invalid_reason = (
                         f"project has no Mockito dependency; rewrite as plain JUnit {junit_version} with no Mockito"
                     )
-            if not invalid_reason:
+            if not invalid_reason and use_generation_compile_gate:
+                with print_lock:
+                    print(f"[{index}/{total}] Compile gate: {test_class} ...")
                 trial_path = write_test_file(project_root, t["package"], test_class, code)
                 compile_log, compile_rc = run_maven_test_compile(project_root, test_filter=test_class)
                 if compile_rc != 0:
-                    tail = "\n".join(strip_ansi(compile_log).splitlines()[-15:])
+                    tail = concise_compile_error_log(compile_log, trial_path, max_lines=15)
                     invalid_reason = f"compilation failed:\n{tail}"
                     try:
                         trial_path.unlink(missing_ok=True)
@@ -685,6 +800,8 @@ def _generate_one_target(
                 else:
                     out_path = trial_path
                     break
+            elif not invalid_reason:
+                break
             prompt_text = (
                 f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
                 f"Target Java version: {project_java_version}. "
@@ -767,6 +884,10 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     max_refinement_iterations = max(
         0,
         int(getattr(args, "max_refinement_iterations", DEFAULT_MAX_ITERATION_REFINEMENTS)),
+    )
+    max_stagnation_iterations = max(
+        0,
+        int(getattr(args, "max_stagnation_iterations", DEFAULT_MAX_STAGNATION_ITERATIONS)),
     )
 
     # 2) Detect build system
@@ -951,6 +1072,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         "resolved_analysis_deleted_files": resolved_deleted_files,
         "resolved_analysis_diff_base": resolved_diff_base,
         "max_refinement_iterations": max_refinement_iterations,
+        "max_stagnation_iterations": max_stagnation_iterations,
         "test_libraries": {"junit": junit_version, "mockito": has_mockito},
     }
     (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -1042,6 +1164,14 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         json.dumps(generation_quality_log, indent=2), encoding="utf-8"
     )
 
+    stale_root = demo_root / "isolation" / "stale_generated_tests"
+    stale_moved = isolate_stale_generated_tests(project_root, generated_paths, stale_root)
+    if stale_moved:
+        print(f"Isolated {len(stale_moved)} stale LLM_Generated test files from prior runs.")
+    (demo_root / "isolation" / "stale_moved_tests.json").write_text(
+        json.dumps(stale_moved, indent=2), encoding="utf-8"
+    )
+
     # Isolate pre-existing non-generated tests so compile/runtime can focus on
     # generated tests only.
     isolation_root = demo_root / "isolation" / "non_generated_tests"
@@ -1059,6 +1189,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     compile_gate_log: List[Dict] = []
     repair_log: List[Dict] = []
     retry_counts: Dict[str, int] = {}
+    compile_repair_attempts = 0
     compile_blocked = False
     compile_blocked_reason = ""
 
@@ -1085,10 +1216,16 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
 
     # --- Phase A: focused compile refinement ---
     print("Running Maven with RAT, Checkstyle, and Enforcer skipped for coverage-only execution.")
-    for _ in range(max(1, len(generated_paths) * (max_refinement_iterations + 1))):
+    compile_loop_limit = max(1, len(generated_paths) * (max_refinement_iterations + 1))
+    compile_attempt = 0
+    for compile_iter in range(compile_loop_limit):
+        compile_attempt += 1
+        print(
+            f"Compile attempt {compile_attempt}/{compile_loop_limit}: mvn test-compile ...",
+            flush=True,
+        )
         last_compile_log, compile_rc = run_maven_test_compile(project_root)
 
-        # FIX #1: always append compile log during REPAIR phase too
         with compile_log_path.open("a", encoding="utf-8") as f:
             f.write(last_compile_log)
             f.write("\n" + ("-" * 80) + "\n")
@@ -1105,7 +1242,10 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
             break
         failing_path = resolve_maven_test_path(project_root, failing_path)
 
-        # save "before repair" artifacts
+        print(
+            f"Focused compile for {failing_path.name} ...",
+            flush=True,
+        )
         with isolate_generated_tests_except(
             project_root,
             failing_path,
@@ -1117,31 +1257,12 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         if focused_compile_rc != 0:
             last_compile_log = focused_compile_log
 
+        compile_errors_for_repair = concise_compile_error_log(last_compile_log, failing_path)
         write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_before")
 
         fp = str(failing_path)
         retries = retry_counts.get(fp, 0)
 
-        # exceeded retries -> move to rejected so summaries and artifacts reflect it.
-        if retries >= max_refinement_iterations:
-            write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
-            moved_to = move_to_rejected_compile(
-                failing_path,
-                last_compile_log,
-                action=f"deleted_after_{max_refinement_iterations}_repairs",
-            )
-            repair_log.append(
-                {
-                    "file": fp,
-                    "moved_to": moved_to,
-                    "errors_tail": concise_error_log(last_compile_log),
-                    "action": f"deleted_after_{max_refinement_iterations}_repairs",
-                }
-            )
-            generated_paths = [p for p in generated_paths if Path(p).exists()]
-            continue
-
-        # attempt GPT repair
         try:
             file_content = failing_path.read_text(encoding="utf-8", errors="ignore")
         except FileNotFoundError:
@@ -1170,27 +1291,63 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         stub_fixed = add_throws_exception_to_test_methods(stub_fixed, last_compile_log)
         if stub_fixed != file_content:
             failing_path.write_text(stub_fixed, encoding="utf-8")
+            compile_repair_attempts += 1
             repair_log.append(
                 {
                     "file": fp,
                     "action": "deterministic_stub_removal",
-                    "errors_tail": concise_error_log(last_compile_log, max_lines=20),
+                    "errors_tail": concise_compile_error_log(last_compile_log, failing_path, max_lines=20),
                 }
             )
             continue
 
-        fixed_code = ollama_repair_test(
-            model=args.gpt_model,
-            compiler_errors=last_compile_log,
-            file_content=file_content,
-            source_text=source_text,
-            package_imports=package_imports,
-            constructor_info=constructor_info,
-            repository_types=repo_types_text,
-            related_type_sources=related_sources,
-            java_version=project_java_version,
-            junit_version=junit_version,
+        if max_refinement_iterations == 0 or retries >= max_refinement_iterations:
+            write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
+            action = (
+                "rejected_no_llm_repair"
+                if max_refinement_iterations == 0
+                else f"deleted_after_{max_refinement_iterations}_repairs"
+            )
+            moved_to = move_to_rejected_compile(failing_path, last_compile_log, action=action)
+            repair_log.append(
+                {
+                    "file": fp,
+                    "moved_to": moved_to,
+                    "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
+                    "action": action,
+                }
+            )
+            generated_paths = [p for p in generated_paths if Path(p).exists()]
+            continue
+
+        print(
+            f"Repairing {test_class} via LLM (attempt {retries + 1}/{max_refinement_iterations}) ...",
+            flush=True,
         )
+        try:
+            fixed_code = ollama_repair_test(
+                model=args.gpt_model,
+                compiler_errors=compile_errors_for_repair,
+                file_content=file_content,
+                source_text=source_text,
+                package_imports=package_imports,
+                constructor_info=constructor_info,
+                repository_types=repo_types_text,
+                related_type_sources=related_sources,
+                java_version=project_java_version,
+                junit_version=junit_version,
+            )
+        except OllamaRepairTimeout as exc:
+            retry_counts[fp] = retries + 1
+            compile_repair_attempts += 1
+            repair_log.append(
+                {
+                    "file": fp,
+                    "action": "repair_timeout",
+                    "errors_tail": str(exc),
+                }
+            )
+            continue
 
         fixed_code = enforce_test_class_name(fixed_code, test_class)
         fixed_code = ensure_junit_imports(fixed_code, junit_version)
@@ -1202,11 +1359,12 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         if not fixed_code.strip() or invalid_fix_reason:
             write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
             retry_counts[fp] = retries + 1
+            compile_repair_attempts += 1
             repair_log.append(
                 {
                     "file": fp,
                     "invalid_fix_reason": invalid_fix_reason,
-                    "errors_tail": concise_error_log(last_compile_log),
+                    "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
                     "action": "invalid_or_empty_fix",
                 }
             )
@@ -1214,10 +1372,11 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
 
         failing_path.write_text(fixed_code, encoding="utf-8")
         retry_counts[fp] = retries + 1
+        compile_repair_attempts += 1
         repair_log.append(
             {
                 "file": fp,
-                "errors_tail": concise_error_log(last_compile_log),
+                "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
                 "action": "fixed",
             }
         )
@@ -1230,7 +1389,10 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     generated_paths = [p for p in generated_paths if Path(p).exists()]
 
     # --- Phase B: Compile gate loop (move remaining failing tests) ---
+    compile_gate_attempt = 0
     for _ in range(10):
+        compile_gate_attempt += 1
+        print(f"Compile gate {compile_gate_attempt}/10: mvn test-compile ...", flush=True)
         last_compile_log, compile_rc = run_maven_test_compile(project_root)
 
         with compile_log_path.open("a", encoding="utf-8") as f:
@@ -1280,12 +1442,23 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     runtime_gate_log: List[Dict] = []
     runtime_repair_log: List[Dict] = []
     runtime_retries: Dict[str, int] = {}
+    runtime_repair_attempts = 0
+    tests_passed_first_run: Optional[int] = None
+    tests_passed_after_repair: Optional[int] = None
+    runtime_rejected_details: List[Dict] = []
     rejected_runtime_root = demo_root / "rejected" / "runtime"
 
     if not early_stop:
         print("\nRuntime stage: running ONLY generated tests with JaCoCo agent")
 
-        def move_to_rejected_runtime(failing_path: Path, errors: str, action: str) -> None:
+        def move_to_rejected_runtime(
+            failing_path: Path,
+            errors: str,
+            action: str,
+            *,
+            method_name: str = "",
+            iterations: int = 0,
+        ) -> None:
             try:
                 rel = failing_path.relative_to(project_root)
             except ValueError:
@@ -1296,18 +1469,43 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 shutil.move(str(failing_path), str(dest))
             except FileNotFoundError:
                 return
+            trimmed = concise_runtime_error_log(
+                errors,
+                class_name=failing_path.stem,
+                method_name=method_name,
+            )
+            failed_txt = dest.with_suffix(".failed.txt")
+            failed_txt.write_text(
+                f"action={action}\niterations={iterations}\nmethod={method_name or '*'}\n\n{trimmed}",
+                encoding="utf-8",
+            )
             runtime_gate_log.append(
                 {
                     "file": str(failing_path),
                     "moved_to": str(dest),
                     "action": action,
-                    "errors_tail": "\n".join(strip_ansi(errors).splitlines()[-80:]),
+                    "method": method_name or None,
+                    "iterations": iterations,
+                    "errors_tail": trimmed,
                 }
             )
 
-        for _ in range(max(1, len(generated_paths) * (max_refinement_iterations + 1))):
+        runtime_loop_limit = max(1, len(generated_paths) * (max_refinement_iterations + 1))
+        runtime_attempt = 0
+
+        for runtime_iter in range(runtime_loop_limit):
+            runtime_attempt += 1
+            print(
+                f"Runtime attempt {runtime_attempt}/{runtime_loop_limit}: mvn test ...",
+                flush=True,
+            )
             test_log, test_rc = run_maven_tests(project_root)
             (demo_root / "runtime" / "test_log.txt").write_text(test_log, encoding="utf-8")
+
+            if tests_passed_first_run is None:
+                tests_passed_first_run = count_passed_generated_tests(
+                    project_root / "target" / "surefire-reports"
+                )
 
             failures = extract_runtime_failures(project_root / "target" / "surefire-reports")
             if test_rc == 0 or not failures:
@@ -1329,6 +1527,10 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 test_filter = class_name.rsplit(".", 1)[-1]
                 if method_name:
                     test_filter = f"{test_filter}#{method_name}"
+                print(
+                    f"Focused runtime test {test_filter} ...",
+                    flush=True,
+                )
                 with isolate_generated_tests_except(
                     project_root,
                     failing_path,
@@ -1338,24 +1540,21 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                         project_root, test_filter=test_filter
                     )
                 if focused_test_rc != 0:
-                    stack_trace = stack_trace or concise_error_log(focused_test_log)
+                    stack_trace = stack_trace or concise_runtime_error_log(
+                        focused_test_log,
+                        class_name=class_name,
+                        method_name=method_name,
+                    )
+                else:
+                    stack_trace = concise_runtime_error_log(
+                        stack_trace or focused_test_log,
+                        class_name=class_name,
+                        method_name=method_name,
+                    )
 
                 write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_before")
 
                 retries = runtime_retries.get(retry_key, 0)
-                if retries >= max_refinement_iterations:
-                    write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_final")
-                    move_to_rejected_runtime(failing_path, stack_trace, action="rejected")
-                    runtime_repair_log.append(
-                        {
-                            "file": fp,
-                            "method": method_name or None,
-                            "action": "rejected",
-                            "errors_tail": concise_error_log(stack_trace),
-                        }
-                    )
-                    changed_any = True
-                    continue
 
                 try:
                     file_content = failing_path.read_text(encoding="utf-8", errors="ignore")
@@ -1383,38 +1582,106 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                     deterministic_fix = ensure_junit_imports(deterministic_fix, junit_version)
                     failing_path.write_text(deterministic_fix, encoding="utf-8")
                     runtime_retries[retry_key] = retries + 1
+                    runtime_repair_attempts += 1
                     runtime_repair_log.append(
                         {
                             "file": fp,
                             "method": method_name or None,
                             "action": "deterministic_runtime_rewrite",
-                            "errors_tail": concise_error_log(stack_trace),
+                            "errors_tail": stack_trace,
                         }
                     )
                     changed_any = True
                     continue
 
-                # FIX #2: keyword call (avoids args/positional confusion)
-                fixed_code = ollama_runtime_repair_test(
-                    model=args.gpt_model,
-                    stack_trace=stack_trace,
-                    file_content=file_content,
-                    failing_method=method_name,
-                    source_text=runtime_source_text,
-                    related_type_sources=runtime_related_sources,
-                    java_version=project_java_version,
-                    junit_version=junit_version,
+                if max_refinement_iterations == 0 or retries >= max_refinement_iterations:
+                    write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_final")
+                    action = (
+                        "rejected_no_llm_repair"
+                        if max_refinement_iterations == 0
+                        else "rejected"
+                    )
+                    move_to_rejected_runtime(
+                        failing_path,
+                        stack_trace,
+                        action=action,
+                        method_name=method_name,
+                        iterations=retries,
+                    )
+                    runtime_repair_log.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": action,
+                            "errors_tail": stack_trace,
+                        }
+                    )
+                    runtime_rejected_details.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": action,
+                            "iterations": retries,
+                            "errors_tail": stack_trace,
+                        }
+                    )
+                    changed_any = True
+                    continue
+
+                print(
+                    f"Repairing {test_class}#{method_name or '*'} via LLM "
+                    f"(attempt {retries + 1}/{max_refinement_iterations}) ...",
+                    flush=True,
                 )
+                try:
+                    fixed_code = ollama_runtime_repair_test(
+                        model=args.gpt_model,
+                        stack_trace=stack_trace,
+                        file_content=file_content,
+                        failing_method=method_name,
+                        source_text=runtime_source_text,
+                        related_type_sources=runtime_related_sources,
+                        java_version=project_java_version,
+                        junit_version=junit_version,
+                    )
+                except OllamaRepairTimeout as exc:
+                    runtime_retries[retry_key] = retries + 1
+                    runtime_repair_attempts += 1
+                    runtime_repair_log.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": "repair_timeout",
+                            "errors_tail": str(exc),
+                        }
+                    )
+                    changed_any = True
+                    continue
 
                 if not fixed_code.strip():
                     write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_final")
-                    move_to_rejected_runtime(failing_path, stack_trace, action="rejected_empty_fix")
+                    move_to_rejected_runtime(
+                        failing_path,
+                        stack_trace,
+                        action="rejected_empty_fix",
+                        method_name=method_name,
+                        iterations=retries + 1,
+                    )
                     runtime_repair_log.append(
                         {
                             "file": fp,
                             "method": method_name or None,
                             "action": "rejected_empty_fix",
-                            "errors_tail": concise_error_log(stack_trace),
+                            "errors_tail": stack_trace,
+                        }
+                    )
+                    runtime_rejected_details.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": "rejected_empty_fix",
+                            "iterations": retries + 1,
+                            "errors_tail": stack_trace,
                         }
                     )
                     changed_any = True
@@ -1427,18 +1694,23 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
 
                 failing_path.write_text(fixed_code, encoding="utf-8")
                 runtime_retries[retry_key] = retries + 1
+                runtime_repair_attempts += 1
                 runtime_repair_log.append(
                     {
                         "file": fp,
                         "method": method_name or None,
                         "action": "fixed",
-                        "errors_tail": concise_error_log(stack_trace),
+                        "errors_tail": stack_trace,
                     }
                 )
                 changed_any = True
 
             if not changed_any:
                 break
+
+        tests_passed_after_repair = count_passed_generated_tests(
+            project_root / "target" / "surefire-reports"
+        )
 
         (demo_root / "runtime" / "runtime_gate_log.json").write_text(
             json.dumps(runtime_gate_log, indent=2), encoding="utf-8"
@@ -1451,7 +1723,21 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         report_log, report_rc = run_maven_report(project_root)
 
         xml_after_runtime = project_root / "target" / "site" / "jacoco" / "jacoco.xml"
-        if test_rc == 0 and report_rc == 0 and xml_after_runtime.exists():
+        survivor_paths = [p for p in generated_paths if Path(p).exists()]
+        runtime_coverage_snapshot = (
+            parse_jacoco_xml(xml_after_runtime) if xml_after_runtime.exists() else {}
+        )
+        coverage_below_threshold = bool(runtime_coverage_snapshot) and any(
+            runtime_coverage_snapshot.get(metric, 0.0) < DEFAULT_COVERAGE_THRESHOLD
+            for metric in ("line_coverage", "instruction_coverage", "branch_coverage")
+        )
+        if (
+            report_rc == 0
+            and xml_after_runtime.exists()
+            and survivor_paths
+            and max_refinement_iterations > 0
+            and coverage_below_threshold
+        ):
             def coverage_related_sources(target: Dict) -> str:
                 return resolve_related_sources(project_root, ast_analysis, target)
 
@@ -1463,13 +1749,18 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 junit_version=junit_version,
                 has_mockito=has_mockito,
                 ast_analysis=ast_analysis,
-                generated_paths=[p for p in generated_paths if Path(p).exists()],
+                generated_paths=survivor_paths,
                 test_target_map=test_target_map,
                 related_sources_provider=coverage_related_sources,
                 project_types_text=project_types_text,
+                max_iterations=max_refinement_iterations,
+                max_stagnation=max_stagnation_iterations,
             )
             refinement.run(xml_after_runtime)
             generated_paths = [p for p in generated_paths if Path(p).exists()]
+            tests_passed_after_repair = count_passed_generated_tests(
+                project_root / "target" / "surefire-reports"
+            )
 
     timing["runtime_coverage_seconds"] = _elapsed_since(stage_started)
 
@@ -1574,16 +1865,23 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         "ollama_model": args.ollama_model,
         "gpt_model": args.gpt_model,
         "max_refinement_iterations": max_refinement_iterations,
+        "max_stagnation_iterations": max_stagnation_iterations,
         "generated_total": len(written_paths) + len(generation_quality_log),
         "generated_written": len(written_paths),
         "generation_rejected": len(generation_quality_log),
         "compile_survivors": compile_survivors,
         "compile_rejected": int(compile_rejected),
+        "compile_repair_attempts": compile_repair_attempts,
         "compile_blocked": compile_blocked,
         "compile_blocked_reason": compile_blocked_reason or None,
         "runtime_survivors": runtime_survivors,
         "runtime_rejected": int(runtime_rejected),
+        "runtime_repair_attempts": runtime_repair_attempts,
+        "runtime_rejected_details": runtime_rejected_details,
+        "tests_passed_first_run": tests_passed_first_run,
+        "tests_passed_after_repair": tests_passed_after_repair,
         "isolated_non_generated_tests": len(isolated_tests),
+        "isolated_stale_generated_tests": len(stale_moved),
         "isolated_tests_manifest": str((demo_root / "isolation" / "moved_tests.json").resolve()),
         "survivor_test_files_in_repo": generated_paths,
         "rejected_compile_dir": str((demo_root / "rejected" / "compile").resolve()),
