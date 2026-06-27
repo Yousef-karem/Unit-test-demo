@@ -261,6 +261,7 @@ def target_from_method(
         "package": package,
         "class_name": class_name,
         "method_name": method_name,
+        "signature_key": signature,
         "signature": java_signature,
         "snippet": method_ast_summary(fqcn, signature, method_info),
         "source_file": source_file,
