@@ -496,6 +496,7 @@ def _generate_one_target(
         )
         code = ""
         invalid_reason = ""
+        out_path: Optional[Path] = None
         source_bundle = f"{related_sources}\n{t.get('snippet') or ''}"
         for attempt in range(3):
             code = sanitize_java_output(ollama_generate(args.ollama_model, prompt_text))
@@ -515,7 +516,18 @@ def _generate_one_target(
                         f"project has no Mockito dependency; rewrite as plain JUnit {junit_version} with no Mockito"
                     )
             if not invalid_reason:
-                break
+                trial_path = write_test_file(project_root, t["package"], test_class, code)
+                compile_log, compile_rc = run_maven_test_compile(project_root, test_filter=test_class)
+                if compile_rc != 0:
+                    tail = "\n".join(strip_ansi(compile_log).splitlines()[-15:])
+                    invalid_reason = f"compilation failed:\n{tail}"
+                    try:
+                        trial_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                else:
+                    out_path = trial_path
+                    break
             prompt_text = (
                 f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
                 f"Target Java version: {project_java_version}. "
@@ -546,7 +558,7 @@ def _generate_one_target(
                 elapsed_seconds=elapsed,
             )
 
-        out_path = write_test_file(project_root, t["package"], test_class, code)
+        out_path = out_path or write_test_file(project_root, t["package"], test_class, code)
         return TargetGenerationResult(
             index=index,
             test_class=test_class,
