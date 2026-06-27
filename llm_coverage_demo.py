@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 
 from demo.config import (
-    DEFAULT_COVERAGE_REFINEMENT_METRICS,
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
     DEFAULT_GENERATION_THREADS,
     DEFAULT_GPT_MODEL,
     DEFAULT_MAX_ITERATION_REFINEMENTS,
+    DEFAULT_MAX_STAGNATION_ITERATIONS,
     DEFAULT_OLLAMA_MODEL,
+    DEFAULT_SKIP_GENERATION_COMPILE_GATE,
 )
 
 
@@ -86,7 +87,19 @@ def main() -> None:
         "--max-refinement-iterations",
         type=int,
         default=DEFAULT_MAX_ITERATION_REFINEMENTS,
-        help="Maximum LLM repair attempts per generated test during compile/runtime refinement",
+        help="Maximum LLM repair attempts per generated test during compile/runtime refinement (default: 5)",
+    )
+    ap.add_argument(
+        "--max-stagnation-iterations",
+        type=int,
+        default=DEFAULT_MAX_STAGNATION_ITERATIONS,
+        help="Maximum consecutive coverage-refinement iterations with no improvement (default: 3)",
+    )
+    ap.add_argument(
+        "--skip-generation-compile-gate",
+        default=DEFAULT_SKIP_GENERATION_COMPILE_GATE,
+        action=argparse.BooleanOptionalAction,
+        help="Skip Maven test-compile during generation; compile stage runs next (default: skip enabled)",
     )
     ap.add_argument(
         "--skip-framework-classes",
