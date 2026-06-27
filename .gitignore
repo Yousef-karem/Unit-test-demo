@@ -15,7 +15,6 @@ __pycache__/
 
 # Demo output (cloned repos, build artifacts, local runs)
 demo_out/
-
 # Archives / local bundles
 *.zip
 
@@ -27,3 +26,5 @@ demo_out/
 
 # Java (if any local Maven target at repo root)
 target/
+
+ast-benchmark/

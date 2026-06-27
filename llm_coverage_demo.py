@@ -77,6 +77,31 @@ def main() -> None:
         default="summary",
         help="AST tree detail stored per method; summary is recommended for large projects",
     )
+    ap.add_argument(
+        "--analysis-incremental",
+        action="store_true",
+        help="Run AST analysis incrementally from a previous analysis file and PR changed-file list",
+    )
+    ap.add_argument(
+        "--analysis-base",
+        default=None,
+        help="Base analysis JSON, manifest.json, or package-shard directory from a previous analyzer run",
+    )
+    ap.add_argument(
+        "--analysis-changed-files",
+        default=None,
+        help="Text file with changed/added .java paths, one per line, relative to the target project root",
+    )
+    ap.add_argument(
+        "--analysis-deleted-files",
+        default=None,
+        help="Optional text file with deleted .java paths, one per line, relative to the target project root",
+    )
+    ap.add_argument(
+        "--analysis-diff-base",
+        default=None,
+        help="Optional Git base ref/commit for automatic incremental changed/deleted file detection",
+    )
     ap.add_argument("--packages", default=None, help='Comma-separated packages, or "ALL" (default). Example: com.app.service,com.app.util')
     ap.add_argument("--select-packages", action="store_true", help="Interactive multi-select packages")
     ap.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL)

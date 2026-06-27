@@ -5,9 +5,13 @@ import json
 import os
 import re
 import shutil
+<<<<<<< Updated upstream
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+=======
+import subprocess
+>>>>>>> Stashed changes
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,6 +72,11 @@ from demo.repo import clone_or_update, detect_build_system
 from demo.test_libraries import detect_junit_version
 from demo.static_analysis import (
     project_type_context_from_analysis,
+<<<<<<< Updated upstream
+=======
+    related_type_sources_from_analysis,
+    run_incremental_ast_analysis,
+>>>>>>> Stashed changes
     run_ast_analysis,
     targets_from_analysis,
 )
@@ -400,6 +409,7 @@ def patch_obsolete_tools_jar_dependency(project_root: Path) -> bool:
     return True
 
 
+<<<<<<< Updated upstream
 @dataclass
 class TargetGenerationResult:
     index: int
@@ -409,6 +419,153 @@ class TargetGenerationResult:
     quality_log_entry: Optional[Dict] = None
     error: Optional[str] = None
     elapsed_seconds: Optional[float] = None
+=======
+def read_changed_java_path_set(path: Path) -> set[str]:
+    changed: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return changed
+    for line in lines:
+        item = line.strip()
+        if not item or item.startswith("#") or not item.endswith(".java"):
+            continue
+        changed.add(item.replace("\\", "/"))
+    return changed
+
+
+def filter_targets_to_changed_files(targets: List[Dict], project_root: Path, changed_files: Path) -> List[Dict]:
+    changed = read_changed_java_path_set(changed_files)
+    if not changed:
+        return targets
+    root = project_root.resolve()
+    filtered: List[Dict] = []
+    for target in targets:
+        source = target.get("source_file")
+        if not source:
+            continue
+        try:
+            rel = Path(source).resolve().relative_to(root).as_posix()
+        except (OSError, ValueError):
+            rel = str(source).replace("\\", "/")
+        if rel in changed:
+            filtered.append(target)
+    return filtered
+
+
+def git_output(project_root: Path, args: List[str]) -> str:
+    p = subprocess.run(
+        ["git", "-C", str(project_root), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if p.returncode != 0:
+        return ""
+    return (p.stdout or "").strip()
+
+
+def current_git_commit(project_root: Path) -> str | None:
+    commit = git_output(project_root, ["rev-parse", "HEAD"])
+    return commit or None
+
+
+def base_commit_from_analysis(path: Path) -> str | None:
+    if path.is_dir():
+        path = path / "manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    commit = data.get("generatedFromCommit")
+    return str(commit) if commit else None
+
+
+def latest_previous_analysis_base(repo_name: str, current_run_root: Path) -> Path | None:
+    runs_root = DEMO_OUT / repo_name / "runs"
+    if not runs_root.is_dir():
+        return None
+    candidates: List[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        try:
+            if path.resolve().is_relative_to(current_run_root.resolve()):
+                return
+        except (OSError, ValueError):
+            pass
+        candidates.append(path)
+
+    # Prefer package-sharded analysis because it scales better and is the normal
+    # artifact when --analysis-full-output is disabled.
+    for manifest in runs_root.glob("*/DemoTestCases/*-shards/manifest.json"):
+        add_candidate(manifest.parent)
+    for path in runs_root.glob("*/DemoTestCases/analysis.json"):
+        add_candidate(path)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def resolve_incremental_base_analysis(args, repo_name: str, run_root: Path) -> Path:
+    explicit = getattr(args, "analysis_base", None)
+    if explicit:
+        return Path(explicit)
+    detected = latest_previous_analysis_base(repo_name, run_root)
+    if detected is None:
+        raise RuntimeError(
+            "--analysis-incremental needs a base analysis. Pass --analysis-base, "
+            "or run one AST analysis first so package shards exist."
+        )
+    print(f"Using previous AST base: {detected}")
+    return detected
+
+
+def resolve_incremental_diff_base(args, project_root: Path, base_analysis: Path) -> str:
+    explicit = getattr(args, "analysis_diff_base", None)
+    if explicit:
+        return explicit
+    base_commit = base_commit_from_analysis(base_analysis)
+    if base_commit:
+        return base_commit
+    previous = git_output(project_root, ["rev-parse", "--verify", "HEAD~1"])
+    if previous:
+        return previous
+    raise RuntimeError(
+        "Could not infer incremental diff base. Pass --analysis-diff-base "
+        "(for example origin/master, HEAD~1, or a specific commit)."
+    )
+
+
+def write_git_diff_lists(project_root: Path, demo_root: Path, diff_base: str, diff_head: str = "HEAD") -> tuple[Path, Path]:
+    changed_path = demo_root / "changed.txt"
+    deleted_path = demo_root / "deleted.txt"
+    diff_range = diff_base if "..." in diff_base else f"{diff_base}...{diff_head}"
+    changed = git_output(
+        project_root,
+        ["diff", "--name-only", "--diff-filter=ACMRT", diff_range, "--", "*.java"],
+    )
+    deleted = git_output(
+        project_root,
+        ["diff", "--name-only", "--diff-filter=D", diff_range, "--", "*.java"],
+    )
+    changed_path.write_text((changed + "\n") if changed else "", encoding="utf-8")
+    deleted_path.write_text((deleted + "\n") if deleted else "", encoding="utf-8")
+    print(f"Incremental diff range: {diff_range}")
+    print(f"Incremental changed Java files: {len([x for x in changed.splitlines() if x.strip()])}")
+    print(f"Incremental deleted Java files: {len([x for x in deleted.splitlines() if x.strip()])}")
+    return changed_path, deleted_path
+
+
+def looks_like_java_test_file(text: str) -> bool:
+    sample = (text or "").lstrip()
+    return bool(
+        re.search(r"(?m)^\s*package\s+[\w.]+\s*;", sample)
+        or re.search(r"(?m)^\s*import\s+", sample)
+        or re.search(r"\bclass\s+\w+Test\b", sample)
+    )
+>>>>>>> Stashed changes
 
 
 def _elapsed_since(start: float) -> float:
@@ -665,25 +822,62 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     # 4) Collect targets
     analysis_mode = getattr(args, "analysis_mode", "ast")
     ast_analysis: Dict | None = None
+    resolved_analysis_base: str | None = None
+    resolved_changed_files: str | None = None
+    resolved_deleted_files: str | None = None
+    resolved_diff_base: str | None = None
     if analysis_mode == "ast":
         analysis_path = demo_root / "analysis.json"
         analyzer_jar = Path(args.analyzer_jar) if getattr(args, "analyzer_jar", None) else None
+        analysis_incremental = bool(getattr(args, "analysis_incremental", False))
+        current_commit = current_git_commit(project_root)
         analysis_shards_dir = (
             Path(args.analysis_shards_dir).resolve()
             if getattr(args, "analysis_shards_dir", None)
             else demo_root / f"{repo_name}-shards"
         )
-        ast_analysis = run_ast_analysis(
-            project_root=project_root,
-            output_path=analysis_path,
-            analyzer_jar=analyzer_jar,
-            classpath=getattr(args, "analysis_classpath", None),
-            output_dir=analysis_shards_dir,
-            threads=getattr(args, "analysis_threads", None),
-            batch_size=getattr(args, "analysis_batch_size", None),
-            ast_tree=getattr(args, "analysis_ast_tree", None),
-            full_output=getattr(args, "analysis_full_output", True),
-        )
+        if analysis_incremental:
+            base_analysis_path = resolve_incremental_base_analysis(args, repo_name, run_root)
+            resolved_analysis_base = str(base_analysis_path)
+            changed_files_arg = getattr(args, "analysis_changed_files", None)
+            deleted_files_arg = getattr(args, "analysis_deleted_files", None)
+            if changed_files_arg:
+                changed_files_path = Path(changed_files_arg)
+                deleted_files_path = Path(deleted_files_arg) if deleted_files_arg else None
+            else:
+                diff_base = resolve_incremental_diff_base(args, project_root, base_analysis_path)
+                resolved_diff_base = diff_base
+                changed_files_path, deleted_files_path = write_git_diff_lists(project_root, demo_root, diff_base)
+            resolved_changed_files = str(changed_files_path)
+            resolved_deleted_files = str(deleted_files_path) if deleted_files_path else None
+            ast_analysis = run_incremental_ast_analysis(
+                project_root=project_root,
+                output_path=analysis_path,
+                base_analysis=base_analysis_path,
+                changed_files=changed_files_path,
+                deleted_files=deleted_files_path,
+                analyzer_jar=analyzer_jar,
+                classpath=getattr(args, "analysis_classpath", None),
+                output_dir=analysis_shards_dir,
+                threads=getattr(args, "analysis_threads", None),
+                batch_size=getattr(args, "analysis_batch_size", None),
+                ast_tree=getattr(args, "analysis_ast_tree", None),
+                commit=current_commit,
+                full_output=getattr(args, "analysis_full_output", True),
+            )
+        else:
+            ast_analysis = run_ast_analysis(
+                project_root=project_root,
+                output_path=analysis_path,
+                analyzer_jar=analyzer_jar,
+                classpath=getattr(args, "analysis_classpath", None),
+                output_dir=analysis_shards_dir,
+                threads=getattr(args, "analysis_threads", None),
+                batch_size=getattr(args, "analysis_batch_size", None),
+                ast_tree=getattr(args, "analysis_ast_tree", None),
+                commit=current_commit,
+                full_output=getattr(args, "analysis_full_output", True),
+            )
         targets = targets_from_analysis(
             analysis=ast_analysis,
             project_root=project_root,
@@ -693,6 +887,12 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
             max_targets=args.max_targets,
             skip_framework_classes=args.skip_framework_classes,
         )
+        if analysis_incremental:
+            targets = filter_targets_to_changed_files(
+                targets,
+                project_root,
+                changed_files_path,
+            )
     else:
         java_files = list_java_files(project_root)
         java_files = [f for f in java_files if file_in_selected_packages(f, project_root, selected)]
@@ -741,6 +941,15 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
         "prompt_mode": getattr(args, "prompt_mode", "llm"),
         "analysis_mode": analysis_mode,
+        "analysis_incremental": bool(getattr(args, "analysis_incremental", False)),
+        "analysis_base": getattr(args, "analysis_base", None),
+        "analysis_changed_files": getattr(args, "analysis_changed_files", None),
+        "analysis_deleted_files": getattr(args, "analysis_deleted_files", None),
+        "analysis_diff_base": getattr(args, "analysis_diff_base", None),
+        "resolved_analysis_base": resolved_analysis_base,
+        "resolved_analysis_changed_files": resolved_changed_files,
+        "resolved_analysis_deleted_files": resolved_deleted_files,
+        "resolved_analysis_diff_base": resolved_diff_base,
         "max_refinement_iterations": max_refinement_iterations,
         "test_libraries": {"junit": junit_version, "mockito": has_mockito},
     }
