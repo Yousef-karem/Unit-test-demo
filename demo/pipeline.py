@@ -52,8 +52,11 @@ from demo.coverage.refinement import CoverageRefinement
 from demo.llm.prompt_writer import (
     ollama_repair_test,
     ollama_runtime_repair_test,
-    ollama_write_prompt,
 )
+from demo.prompt_generation.factory import create_prompt_generator
+from demo.prompt_generation.helpers import resolve_related_sources
+from demo.prompt_generation.models import PromptGenerationContext
+from demo.prompt_generation.protocol import PromptGenerator
 from demo.llm.ollama import ollama_generate
 from demo.packages import (
     choose_packages_interactive,
@@ -65,7 +68,6 @@ from demo.repo import clone_or_update, detect_build_system
 from demo.test_libraries import detect_junit_version
 from demo.static_analysis import (
     project_type_context_from_analysis,
-    related_type_sources_from_analysis,
     run_ast_analysis,
     targets_from_analysis,
 )
@@ -74,7 +76,6 @@ from demo.utils import (
     ensure_unique_run_class_name,
     ensure_junit_imports,
     enforce_test_class_name,
-    find_concrete_impls,
     load_env_file,
     remove_invented_api_stubs,
     repo_name_from_arg,
@@ -120,68 +121,6 @@ def ensure_unique_test_class_name(base: str, t: Dict, mode: str) -> str:
 # ----------------------------
 
 TYPE_DECL_RE = re.compile(r"\b(class|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
-TYPE_NAME_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\b")
-SKIP_RELATED_TYPES = frozenset(
-    {
-        "String", "Integer", "Boolean", "Long", "Double", "Float", "Short", "Byte",
-        "Character", "Object", "Class", "Void", "Override", "Test", "BeforeEach",
-        "AfterEach", "Mock", "InjectMocks", "Collection", "List", "Map", "Set",
-        "Optional", "Arrays", "Collections", "Assertions",
-    }
-)
-
-
-def collect_related_type_sources(project_root: Path, target: Dict) -> str:
-    own_class = target.get("class_name") or ""
-    text = " ".join(
-        [
-            target.get("signature") or "",
-            target.get("snippet") or "",
-            own_class,
-        ]
-    )
-    related_names = {
-        name for name in TYPE_NAME_RE.findall(text)
-        if name not in SKIP_RELATED_TYPES and name != own_class
-    }
-    if not related_names:
-        return ""
-
-    by_name: Dict[str, str] = {}
-    for f in list_java_files(project_root):
-        if f.stem not in related_names or f.stem in by_name:
-            continue
-        try:
-            rel = f.relative_to(project_root)
-            by_name[f.stem] = f"// {rel}\n{f.read_text(encoding='utf-8', errors='ignore')}"
-        except (OSError, ValueError):
-            continue
-
-    # Pull in concrete classes that implement referenced interfaces.
-    interface_names = [
-        name for name, src in by_name.items()
-        if re.search(rf"\binterface\s+{re.escape(name)}\b", src)
-    ]
-    if interface_names:
-        for f in list_java_files(project_root):
-            if f.stem in by_name:
-                continue
-            try:
-                txt = f.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for iface in interface_names:
-                if re.search(
-                    rf"\bclass\s+{re.escape(f.stem)}\s+implements\s+[^{{;]*\b{re.escape(iface)}\b",
-                    txt,
-                ):
-                    rel = f.relative_to(project_root)
-                    by_name[f.stem] = f"// {rel}\n{txt}"
-                    break
-
-    return "\n\n".join(by_name[name] for name in sorted(by_name))
-
-
 def list_project_types(project_root: Path) -> List[str]:
     types = set()
     for f in list_java_files(project_root):
@@ -461,65 +400,6 @@ def patch_obsolete_tools_jar_dependency(project_root: Path) -> bool:
     return True
 
 
-def looks_like_java_test_file(text: str) -> bool:
-    sample = (text or "").lstrip()
-    return bool(
-        re.search(r"(?m)^\s*package\s+[\w.]+\s*;", sample)
-        or re.search(r"(?m)^\s*import\s+", sample)
-        or re.search(r"\bclass\s+\w+Test\b", sample)
-    )
-
-
-def build_direct_generation_prompt(
-    target: Dict,
-    test_class: str,
-    project_types_text: str,
-    java_version: str,
-    junit_version: str,
-    has_mockito: bool,
-) -> str:
-    pkg = target.get("package") or "(default)"
-    mockito_rule = (
-        "Mockito is available, but do NOT mock domain/value interfaces when a concrete implementation exists. "
-        "Prefer real objects so production code executes."
-        if has_mockito
-        else "Mockito is not available; do not import or use org.mockito, @Mock, when, verify, or MockitoAnnotations."
-    )
-    junit_rule = (
-        "Use org.junit.Test and static org.junit.Assert.*. Do not use JUnit Jupiter."
-        if junit_version == "4"
-        else "Use org.junit.jupiter.api.Test and org.junit.jupiter.api.Assertions.*. Do not use org.junit.Test."
-    )
-    return f"""
-Output ONLY a complete Java test file. No markdown. No explanations.
-Generate test class exactly: {test_class}
-Package: {pkg}
-Target Java version: {java_version}. {java_version_guidance(java_version)}
-Target framework: JUnit {junit_version}. {junit_rule}
-{mockito_rule}
-
-Hard rules:
-- Every @Test must call real production code from target class {target.get("class_name")}.
-- Do not mock the class under test.
-- For interface parameters, use a concrete implementation from the project type context when present.
-- Do not put null as the first element of arrays unless the test explicitly expects NullPointerException.
-- For Item[] or similar arrays, create non-null concrete Item implementations for all normal-path tests.
-- Use only methods, fields, and constructors shown in the source/AST/project type context.
-- At least 3 @Test methods with concrete assertions.
-
-Target:
-- class: {target.get("class_name")}
-- method: {target.get("method_name") or "(class mode)"}
-- signature: {target.get("signature") or "(entire class)"}
-
-Source/AST summary:
-{target.get("snippet") or ""}
-
-Project type context:
-{project_types_text}
-""".strip()
-
-
 @dataclass
 class TargetGenerationResult:
     index: int
@@ -564,6 +444,7 @@ def _generate_one_target(
     used_test_class_names: Set[str],
     name_lock: threading.Lock,
     print_lock: threading.Lock,
+    prompt_generator: PromptGenerator,
 ) -> TargetGenerationResult:
     worker_start = time.perf_counter()
     try:
@@ -573,52 +454,41 @@ def _generate_one_target(
             else list_project_type_context(project_root)
         )
         project_types_text = "\n".join(project_type_context[:250]) or ", ".join(project_types[:250])
-        g = ollama_write_prompt(args.gpt_model, t, project_types_text, java_version=project_java_version)
+        generated = prompt_generator.generate(
+            PromptGenerationContext(
+                target=t,
+                project_root=project_root,
+                ast_analysis=ast_analysis,
+                project_java_version=project_java_version,
+                junit_version=junit_version,
+                has_mockito=has_mockito,
+                project_types_text=project_types_text,
+                target_mode=args.mode,
+            )
+        )
 
-        test_class = g.get("test_class_name", "")
-        test_class = ensure_unique_test_class_name(test_class, t, args.mode)
+        test_class = ensure_unique_test_class_name(generated.test_class_name, t, args.mode)
         with name_lock:
             test_class = ensure_unique_run_class_name(test_class, used_test_class_names, index)
             used_test_class_names.add(test_class)
 
         (demo_root / "prompts" / f"{test_class}.json").write_text(
-            json.dumps({"test_class_name": test_class, "prompt": g["prompt"]}, indent=2),
+            json.dumps(
+                {
+                    "test_class_name": test_class,
+                    "prompt": generated.prompt,
+                    **generated.metadata,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
         with print_lock:
             print(f"[{index}/{total}] Generating {test_class} ...")
 
-        related_sources = (
-            related_type_sources_from_analysis(ast_analysis, t)
-            if ast_analysis is not None
-            else collect_related_type_sources(project_root, t)
-        )
-        base_prompt = g.get("prompt", "")
-        if looks_like_java_test_file(base_prompt):
-            base_prompt = build_direct_generation_prompt(
-                target=t,
-                test_class=test_class,
-                project_types_text=project_types_text,
-                java_version=project_java_version,
-                junit_version=junit_version,
-                has_mockito=has_mockito,
-            )
-        if related_sources:
-            impl_hints: List[str] = []
-            sig_text = t.get("signature") or ""
-            for type_name in TYPE_NAME_RE.findall(sig_text):
-                for impl in find_concrete_impls(related_sources, type_name):
-                    impl_hints.append(
-                        f"For `{type_name}` parameters, use `new {impl}(...)` — do NOT @Mock `{type_name}`."
-                    )
-            base_prompt = (
-                f"{base_prompt}\n\n"
-                "Related type sources (use ONLY APIs shown here; do not invent methods):\n"
-                f"{related_sources}"
-            )
-            if impl_hints:
-                base_prompt += "\n\n" + "\n".join(dict.fromkeys(impl_hints))
+        related_sources = resolve_related_sources(project_root, ast_analysis, t)
+        base_prompt = generated.prompt
         prompt_text = (
             f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
             f"Target Java version: {project_java_version}. "
@@ -698,7 +568,8 @@ def _generate_one_target(
 # Pipeline
 # ----------------------------
 
-def run_pipeline(args) -> None:
+def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
+    prompt_gen = prompt_generator or create_prompt_generator(args)
     run_started = time.perf_counter()
     started_at = datetime.now().isoformat(timespec="seconds")
     stage_started = run_started
@@ -856,6 +727,7 @@ def run_pipeline(args) -> None:
         "resolved_junit_version": junit_version,
         "selected_packages": selected,
         "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
+        "prompt_mode": getattr(args, "prompt_mode", "llm"),
         "analysis_mode": analysis_mode,
         "max_refinement_iterations": max_refinement_iterations,
         "test_libraries": {"junit": junit_version, "mockito": has_mockito},
@@ -905,6 +777,7 @@ def run_pipeline(args) -> None:
                 used_test_class_names=used_test_class_names,
                 name_lock=name_lock,
                 print_lock=print_lock,
+                prompt_generator=prompt_gen,
             )
             for i, t in enumerate(targets, 1)
         ]
@@ -1069,11 +942,7 @@ def run_pipeline(args) -> None:
             except OSError:
                 pass
 
-        related_sources = (
-            related_type_sources_from_analysis(ast_analysis, target)
-            if ast_analysis is not None
-            else collect_related_type_sources(project_root, target)
-        )
+        related_sources = resolve_related_sources(project_root, ast_analysis, target)
         source_bundle = f"{related_sources}\n{source_text}"
         stub_fixed = remove_invented_api_stubs(file_content, source_bundle)
         stub_fixed = rewrite_interface_mocks_to_concrete(stub_fixed, related_sources)
@@ -1275,11 +1144,7 @@ def run_pipeline(args) -> None:
                 test_class = failing_path.stem
                 target = test_target_map.get(test_class, {})
                 runtime_source_text = ""
-                runtime_related_sources = (
-                    related_type_sources_from_analysis(ast_analysis, target)
-                    if ast_analysis is not None
-                    else collect_related_type_sources(project_root, target)
-                )
+                runtime_related_sources = resolve_related_sources(project_root, ast_analysis, target)
                 src_path = target.get("source_file")
                 if src_path:
                     try:
@@ -1367,11 +1232,7 @@ def run_pipeline(args) -> None:
         xml_after_runtime = project_root / "target" / "site" / "jacoco" / "jacoco.xml"
         if test_rc == 0 and report_rc == 0 and xml_after_runtime.exists():
             def coverage_related_sources(target: Dict) -> str:
-                return (
-                    related_type_sources_from_analysis(ast_analysis, target)
-                    if ast_analysis is not None
-                    else collect_related_type_sources(project_root, target)
-                )
+                return resolve_related_sources(project_root, ast_analysis, target)
 
             refinement = CoverageRefinement(
                 project_root=project_root,
@@ -1539,3 +1400,11 @@ def run_pipeline(args) -> None:
         print(f"- Branch:      {coverage['branch_coverage']*100:.2f}%")
 
     _print_timing_summary(timing_summary)
+
+
+class Pipeline:
+    def __init__(self, prompt_generator: PromptGenerator) -> None:
+        self._prompt_generator = prompt_generator
+
+    def run(self, args) -> None:
+        run_pipeline(args, prompt_generator=self._prompt_generator)
