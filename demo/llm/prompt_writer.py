@@ -4,7 +4,7 @@ import json
 import requests
 from typing import Dict, Tuple
 
-from demo.config import OLLAMA_URL, GENERATED_PREFIX
+from demo.config import OLLAMA_URL, GENERATED_PREFIX, DEFAULT_OLLAMA_REPAIR_TIMEOUT
 from demo.coverage.java_version import java_version_guidance
 from demo.targets import extract_imports_context
 from demo.utils import sanitize_java_output
@@ -12,6 +12,11 @@ from demo.utils import sanitize_java_output
 # Timeout for Ollama requests (seconds). Repair prompts can be large,
 # so a generous timeout is needed for smaller local models.
 OLLAMA_TIMEOUT = 600
+OLLAMA_REPAIR_TIMEOUT = DEFAULT_OLLAMA_REPAIR_TIMEOUT
+
+
+class OllamaRepairTimeout(RuntimeError):
+    """Raised when an Ollama repair request exceeds its timeout."""
 
 
 def _check_ollama_response(r: requests.Response, model: str) -> None:
@@ -68,7 +73,13 @@ def ollama_generate_json(model: str, prompt: str, system: str | None = None) -> 
     return _extract_first_json_object(resp_text)
 
 
-def ollama_generate_text(model: str, prompt: str, system: str | None = None) -> str:
+def ollama_generate_text(
+    model: str,
+    prompt: str,
+    system: str | None = None,
+    *,
+    timeout: int | None = None,
+) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
@@ -77,7 +88,12 @@ def ollama_generate_text(model: str, prompt: str, system: str | None = None) -> 
     }
     if system:
         payload["system"] = system
-    r = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+    try:
+        r = requests.post(OLLAMA_URL, json=payload, timeout=timeout or OLLAMA_TIMEOUT)
+    except requests.Timeout as exc:
+        raise OllamaRepairTimeout(
+            f"Ollama request timed out after {timeout or OLLAMA_TIMEOUT}s"
+        ) from exc
     _check_ollama_response(r, model)
     return (r.json().get("response") or "").strip()
 
@@ -278,7 +294,34 @@ Do not mock the class or method under test. Each test must call real production 
 Do not invent dependency types. If a referenced type (e.g., UserRepository) does not exist in the project, replace it with the closest matching real type from the repository list or remove that dependency and adjust the test accordingly.
 """.strip()
 
-    return sanitize_java_output(ollama_generate_text(model, user, sys))
+    return sanitize_java_output(
+        ollama_generate_text(model, user, sys, timeout=OLLAMA_REPAIR_TIMEOUT)
+    )
+
+
+def _assertion_error_repair_guidance(stack_trace: str, source_text: str) -> str:
+    if "AssertionError" not in stack_trace:
+        return ""
+    lines = [
+        "ASSERTION FAILURE GUIDANCE:",
+        "- Fix incorrect expected values; match assertions to observable behavior in the source code.",
+        "- Do not assert on exact stdout line counts when the method prints once per match in a loop.",
+        "- Prefer partial output checks (contains) over brittle exact string equality when appropriate.",
+    ]
+    if "System.out" in source_text or "println" in source_text:
+        lines.extend(
+            [
+                "- For stdout side effects: capture with ByteArrayOutputStream and System.setOut in @Before; "
+                "restore in @After. Assert out.toString().contains(\"expected fragment\").",
+                "- NEVER use System.out.toString() to assert printed output.",
+            ]
+        )
+    if "static" in source_text and "void" in source_text:
+        lines.append(
+            "- For static void methods: call ClassName.methodName(...) directly; "
+            "assert on captured IO or side effects, not return values."
+        )
+    return "\n".join(lines)
 
 
 def ollama_runtime_repair_test(
@@ -295,6 +338,7 @@ def ollama_runtime_repair_test(
         "You are a senior Java testing expert. "
         f"You fix runtime errors in JUnit {junit_version} tests."
     )
+    assertion_guidance = _assertion_error_repair_guidance(stack_trace, source_text)
     user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
@@ -304,6 +348,8 @@ Failing test method:
 
 Stack trace:
 {stack_trace}
+
+{assertion_guidance}
 
 File content:
 {file_content}
@@ -319,4 +365,6 @@ If the stack trace shows a NullPointerException from an array element or interfa
 For interface parameters, use concrete implementations and constructors shown above. Do not mock domain/value interfaces when concrete implementations exist.
 """.strip()
 
-    return sanitize_java_output(ollama_generate_text(model, user, sys))
+    return sanitize_java_output(
+        ollama_generate_text(model, user, sys, timeout=OLLAMA_REPAIR_TIMEOUT)
+    )

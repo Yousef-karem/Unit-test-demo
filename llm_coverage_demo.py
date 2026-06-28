@@ -3,13 +3,15 @@ from __future__ import annotations
 import argparse
 
 from demo.config import (
-    DEFAULT_COVERAGE_REFINEMENT_METRICS,
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
     DEFAULT_GENERATION_THREADS,
     DEFAULT_GPT_MODEL,
+    DEFAULT_PROMPT_MODE,
     DEFAULT_MAX_ITERATION_REFINEMENTS,
+    DEFAULT_MAX_STAGNATION_ITERATIONS,
     DEFAULT_OLLAMA_MODEL,
+    DEFAULT_SKIP_GENERATION_COMPILE_GATE,
 )
 
 
@@ -24,6 +26,12 @@ def main() -> None:
     )
     ap.add_argument("--branch", default=None)
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
+    ap.add_argument(
+        "--prompt-mode",
+        choices=["llm", "static"],
+        default=DEFAULT_PROMPT_MODE,
+        help="Prompt generation strategy: llm (LLM meta-prompt) or static (AST semantic prompt builder)",
+    )
     ap.add_argument("--build", choices=["auto", "maven", "gradle"], default="auto")
     ap.add_argument(
         "--analysis-mode",
@@ -70,6 +78,31 @@ def main() -> None:
         default="summary",
         help="AST tree detail stored per method; summary is recommended for large projects",
     )
+    ap.add_argument(
+        "--analysis-incremental",
+        action="store_true",
+        help="Run AST analysis incrementally from a previous analysis file and PR changed-file list",
+    )
+    ap.add_argument(
+        "--analysis-base",
+        default=None,
+        help="Base analysis JSON, manifest.json, or package-shard directory from a previous analyzer run",
+    )
+    ap.add_argument(
+        "--analysis-changed-files",
+        default=None,
+        help="Text file with changed/added .java paths, one per line, relative to the target project root",
+    )
+    ap.add_argument(
+        "--analysis-deleted-files",
+        default=None,
+        help="Optional text file with deleted .java paths, one per line, relative to the target project root",
+    )
+    ap.add_argument(
+        "--analysis-diff-base",
+        default=None,
+        help="Optional Git base ref/commit for automatic incremental changed/deleted file detection",
+    )
     ap.add_argument("--packages", default=None, help='Comma-separated packages, or "ALL" (default). Example: com.app.service,com.app.util')
     ap.add_argument("--select-packages", action="store_true", help="Interactive multi-select packages")
     ap.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL)
@@ -86,7 +119,19 @@ def main() -> None:
         "--max-refinement-iterations",
         type=int,
         default=DEFAULT_MAX_ITERATION_REFINEMENTS,
-        help="Maximum LLM repair attempts per generated test during compile/runtime refinement",
+        help="Maximum LLM repair attempts per generated test during compile/runtime refinement (default: 5)",
+    )
+    ap.add_argument(
+        "--max-stagnation-iterations",
+        type=int,
+        default=DEFAULT_MAX_STAGNATION_ITERATIONS,
+        help="Maximum consecutive coverage-refinement iterations with no improvement (default: 3)",
+    )
+    ap.add_argument(
+        "--skip-generation-compile-gate",
+        default=DEFAULT_SKIP_GENERATION_COMPILE_GATE,
+        action=argparse.BooleanOptionalAction,
+        help="Skip Maven test-compile during generation; compile stage runs next (default: skip enabled)",
     )
     ap.add_argument(
         "--skip-framework-classes",
@@ -119,9 +164,12 @@ def main() -> None:
         return
     if not args.repo:
         ap.error("--repo is required unless --from-run is provided.")
-    from demo.pipeline import run_pipeline
+    if args.prompt_mode == "static" and args.analysis_mode != "ast":
+        ap.error("Static prompt mode requires --analysis-mode ast")
+    from demo.prompt_generation.factory import create_prompt_generator
+    from demo.pipeline import Pipeline
 
-    run_pipeline(args)
+    Pipeline(create_prompt_generator(args)).run(args)
 
 
 if __name__ == "__main__":

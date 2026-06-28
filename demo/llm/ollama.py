@@ -12,6 +12,6 @@ def ollama_generate(model: str, prompt: str) -> str:
         "stream": False,
         "options": {"temperature": 0.2, "num_predict": 2200},
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    r = requests.post(OLLAMA_URL, json=payload, timeout=1000)
     r.raise_for_status()
     return (r.json().get("response") or "").strip()

@@ -85,6 +85,7 @@ def run_ast_analysis(
     threads: Optional[int] = None,
     batch_size: Optional[int] = None,
     ast_tree: Optional[str] = None,
+    commit: Optional[str] = None,
     full_output: bool = True,
 ) -> Dict:
     project_root = project_root.resolve()
@@ -121,11 +122,93 @@ def run_ast_analysis(
         cmd.extend(["--batch-size", str(batch_size)])
     if ast_tree:
         cmd.extend(["--ast-tree", ast_tree])
+    if commit:
+        cmd.extend(["--commit", commit])
 
     p = subprocess.run(cmd, cwd=str(project_root), text=True, capture_output=True)
     if p.returncode != 0:
         raise RuntimeError(
             "Static analyzer failed.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"STDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
+        )
+
+    if output_dir is not None and not full_output:
+        return load_package_shards(output_dir)
+    return json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def run_incremental_ast_analysis(
+    project_root: Path,
+    output_path: Path,
+    base_analysis: Path,
+    changed_files: Path,
+    deleted_files: Optional[Path] = None,
+    analyzer_jar: Optional[Path] = None,
+    classpath: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+    threads: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    ast_tree: Optional[str] = None,
+    commit: Optional[str] = None,
+    full_output: bool = True,
+) -> Dict:
+    project_root = project_root.resolve()
+    output_path = output_path.resolve()
+    base_analysis = base_analysis.resolve()
+    changed_files = changed_files.resolve()
+    deleted_files = deleted_files.resolve() if deleted_files is not None else None
+    output_dir = output_dir.resolve() if output_dir is not None else None
+    jar = (analyzer_jar or default_analyzer_jar()).resolve()
+    if not jar.exists():
+        raise RuntimeError(
+            f"Analyzer JAR not found: {jar}. Put `testnexus-analyzer-1.0.0.jar` "
+            "in the project root, or pass --analyzer-jar."
+        )
+    if not (base_analysis.is_file() or base_analysis.is_dir()):
+        raise RuntimeError(f"Base AST analysis file or shard directory not found: {base_analysis}")
+    if not changed_files.is_file():
+        raise RuntimeError(f"Changed-files list not found: {changed_files}")
+    if deleted_files is not None and not deleted_files.is_file():
+        raise RuntimeError(f"Deleted-files list not found: {deleted_files}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "java",
+        "-jar",
+        str(jar),
+        "--mode",
+        "incremental",
+        "--project-root",
+        str(project_root),
+        "--base-analysis",
+        str(base_analysis),
+        "--changed-files",
+        str(changed_files),
+    ]
+    if deleted_files is not None:
+        cmd.extend(["--deleted-files", str(deleted_files)])
+    if full_output or output_dir is None:
+        cmd.extend(["--output", str(output_path)])
+    cp = classpath or infer_project_classpath(project_root)
+    if cp:
+        cmd.extend(["--classpath", cp])
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cmd.extend(["--output-dir", str(output_dir)])
+    if threads is not None and threads > 0:
+        cmd.extend(["--threads", str(threads)])
+    if batch_size is not None and batch_size > 0:
+        cmd.extend(["--batch-size", str(batch_size)])
+    if ast_tree:
+        cmd.extend(["--ast-tree", ast_tree])
+    if commit:
+        cmd.extend(["--commit", commit])
+
+    p = subprocess.run(cmd, cwd=str(project_root), text=True, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(
+            "Incremental static analyzer failed.\n"
             f"Command: {' '.join(cmd)}\n"
             f"STDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
         )
@@ -315,10 +398,13 @@ def target_from_method(
         "package": package,
         "class_name": class_name,
         "method_name": method_name,
+        "signature_key": signature,
         "signature": java_signature,
         "snippet": method_ast_summary(fqcn, signature, method_info),
         "source_file": source_file,
         "package_line": f"package {package};" if package else "",
+        "start_line": method_info.get("startLine"),
+        "end_line": method_info.get("endLine"),
         "ast": ast,
         "analysis_source": "ast",
         "analysis_shard_file": shard_file,
@@ -750,16 +836,57 @@ def project_type_context_from_analysis(analysis: Dict, target: Optional[Dict] = 
     return sorted(context)
 
 
-def related_type_sources_from_analysis(analysis: Dict, target: Dict) -> str:
+def read_class_source_snippet(class_info: Dict, project_root: Path, max_lines: int = 120) -> str:
+    file_path = class_info.get("filePath")
+    if not file_path:
+        return ""
+    source_path = project_root / file_path
+    try:
+        text = source_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[:max_lines]) + "\n// ... truncated ..."
+
+
+def _domain_kind_label(class_info: Dict) -> str:
+    return (class_info.get("domainKind") or "general").lower()
+
+
+def related_type_sources_from_analysis(
+    analysis: Dict,
+    target: Dict,
+    project_root: Path | None = None,
+) -> str:
+    deps = target.get("dependencies") or {}
     names = set(simple_names(type_names_from_target(target)))
+    uses = set(simple_names(deps.get("usesTypes") or []))
+    if uses:
+        filtered = {n for n in names if n in uses}
+        if filtered:
+            names = filtered
     if not names:
         return ""
+
+    root = project_root
+    if root is None:
+        root_path = analysis.get("projectRoot")
+        if root_path:
+            root = Path(root_path)
 
     chunks: List[str] = []
     for fqcn, class_info in context_classes_for_target(analysis, target):
         _, class_name = split_fqcn(fqcn)
         if class_name not in names or class_name == target.get("class_name"):
             continue
+        domain = _domain_kind_label(class_info)
+        if root and domain in ("entity", "dto"):
+            source = read_class_source_snippet(class_info, root)
+            if source.strip():
+                chunks.append(f"// source: {class_info.get('filePath', fqcn)}\n{source}")
+                continue
         chunks.append(class_ast_summary(fqcn, class_info))
     return "\n\n".join(chunks)
 
