@@ -5,13 +5,10 @@ import json
 import os
 import re
 import shutil
-<<<<<<< Updated upstream
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-=======
 import subprocess
->>>>>>> Stashed changes
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -72,11 +69,8 @@ from demo.repo import clone_or_update, detect_build_system
 from demo.test_libraries import detect_junit_version
 from demo.static_analysis import (
     project_type_context_from_analysis,
-<<<<<<< Updated upstream
-=======
     related_type_sources_from_analysis,
     run_incremental_ast_analysis,
->>>>>>> Stashed changes
     run_ast_analysis,
     targets_from_analysis,
 )
@@ -409,7 +403,6 @@ def patch_obsolete_tools_jar_dependency(project_root: Path) -> bool:
     return True
 
 
-<<<<<<< Updated upstream
 @dataclass
 class TargetGenerationResult:
     index: int
@@ -419,7 +412,6 @@ class TargetGenerationResult:
     quality_log_entry: Optional[Dict] = None
     error: Optional[str] = None
     elapsed_seconds: Optional[float] = None
-=======
 def read_changed_java_path_set(path: Path) -> set[str]:
     changed: set[str] = set()
     try:
@@ -565,7 +557,6 @@ def looks_like_java_test_file(text: str) -> bool:
         or re.search(r"(?m)^\s*import\s+", sample)
         or re.search(r"\bclass\s+\w+Test\b", sample)
     )
->>>>>>> Stashed changes
 
 
 def _elapsed_since(start: float) -> float:
