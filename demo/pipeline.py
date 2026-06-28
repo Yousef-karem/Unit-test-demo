@@ -57,7 +57,7 @@ from demo.llm.prompt_writer import (
     ollama_runtime_repair_test,
 )
 from demo.prompt_generation.factory import create_prompt_generator
-from demo.prompt_generation.helpers import resolve_related_sources
+from demo.prompt_generation.helpers import collect_related_type_sources, resolve_related_sources
 from demo.prompt_generation.models import PromptGenerationContext
 from demo.prompt_generation.protocol import PromptGenerator
 from demo.llm.ollama import ollama_generate
@@ -78,11 +78,16 @@ from demo.static_analysis import (
 )
 from demo.targets import _extract_imports_context_from_text, extract_targets
 from demo.utils import (
+    align_junit_framework,
     ensure_unique_run_class_name,
     ensure_junit_imports,
     enforce_test_class_name,
     load_env_file,
     remove_invented_api_stubs,
+    repair_inaccessible_field_accesses,
+    repair_int_array_capacity_for_runtime_errors,
+    repair_missing_getter_calls,
+    repair_runtime_semantic_mismatches,
     repo_name_from_arg,
     rewrite_interface_mocks_to_concrete,
     sanitize_java_output,
@@ -1155,22 +1160,24 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         json.dumps(generation_quality_log, indent=2), encoding="utf-8"
     )
 
-    stale_root = demo_root / "isolation" / "stale_generated_tests"
+    isolation_dir = demo_root / "isolation"
+    isolation_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_root = isolation_dir / "stale_generated_tests"
     stale_moved = isolate_stale_generated_tests(project_root, generated_paths, stale_root)
     if stale_moved:
         print(f"Isolated {len(stale_moved)} stale LLM_Generated test files from prior runs.")
-    (demo_root / "isolation" / "stale_moved_tests.json").write_text(
+    (isolation_dir / "stale_moved_tests.json").write_text(
         json.dumps(stale_moved, indent=2), encoding="utf-8"
     )
 
     # Isolate pre-existing non-generated tests so compile/runtime can focus on
     # generated tests only.
-    isolation_root = demo_root / "isolation" / "non_generated_tests"
+    isolation_root = isolation_dir / "non_generated_tests"
     isolated_tests = isolate_non_generated_test_files(project_root, generated_paths, isolation_root)
     if isolated_tests:
         print(f"Isolated {len(isolated_tests)} pre-existing non-generated test files.")
-    (demo_root / "isolation").mkdir(parents=True, exist_ok=True)
-    (demo_root / "isolation" / "moved_tests.json").write_text(
+    (isolation_dir / "moved_tests.json").write_text(
         json.dumps(isolated_tests, indent=2), encoding="utf-8"
     )
 
@@ -1276,9 +1283,19 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 pass
 
         related_sources = resolve_related_sources(project_root, ast_analysis, target)
+        repo_related_sources = collect_related_type_sources(project_root, target)
+        if repo_related_sources and repo_related_sources not in related_sources:
+            related_sources = f"{related_sources}\n\n{repo_related_sources}".strip()
         source_bundle = f"{related_sources}\n{source_text}"
-        stub_fixed = remove_invented_api_stubs(file_content, source_bundle)
+        stub_fixed = align_junit_framework(file_content, junit_version)
+        stub_fixed = remove_invented_api_stubs(stub_fixed, source_bundle)
         stub_fixed = rewrite_interface_mocks_to_concrete(stub_fixed, related_sources)
+        stub_fixed = repair_inaccessible_field_accesses(
+            stub_fixed, compile_errors_for_repair, source_bundle
+        )
+        stub_fixed = repair_missing_getter_calls(
+            stub_fixed, compile_errors_for_repair, source_bundle
+        )
         stub_fixed = add_throws_exception_to_test_methods(stub_fixed, last_compile_log)
         if stub_fixed != file_content:
             failing_path.write_text(stub_fixed, encoding="utf-8")
@@ -1286,7 +1303,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
             repair_log.append(
                 {
                     "file": fp,
-                    "action": "deterministic_stub_removal",
+                    "action": "deterministic_compile_repair",
                     "errors_tail": concise_compile_error_log(last_compile_log, failing_path, max_lines=20),
                 }
             )
@@ -1341,9 +1358,16 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
             continue
 
         fixed_code = enforce_test_class_name(fixed_code, test_class)
+        fixed_code = align_junit_framework(fixed_code, junit_version)
         fixed_code = ensure_junit_imports(fixed_code, junit_version)
         fixed_code = remove_invented_api_stubs(fixed_code, source_bundle)
         fixed_code = rewrite_interface_mocks_to_concrete(fixed_code, related_sources)
+        fixed_code = repair_inaccessible_field_accesses(
+            fixed_code, compile_errors_for_repair, source_bundle
+        )
+        fixed_code = repair_missing_getter_calls(
+            fixed_code, compile_errors_for_repair, source_bundle
+        )
         fixed_code = add_throws_exception_to_test_methods(fixed_code, last_compile_log)
 
         invalid_fix_reason = validate_java_test_output(fixed_code, test_class)
@@ -1556,6 +1580,14 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 target = test_target_map.get(test_class, {})
                 runtime_source_text = ""
                 runtime_related_sources = resolve_related_sources(project_root, ast_analysis, target)
+                runtime_repo_related_sources = collect_related_type_sources(project_root, target)
+                if (
+                    runtime_repo_related_sources
+                    and runtime_repo_related_sources not in runtime_related_sources
+                ):
+                    runtime_related_sources = (
+                        f"{runtime_related_sources}\n\n{runtime_repo_related_sources}".strip()
+                    )
                 src_path = target.get("source_file")
                 if src_path:
                     try:
@@ -1564,9 +1596,16 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                         pass
 
                 source_bundle = f"{runtime_related_sources}\n{runtime_source_text}"
-                deterministic_fix = remove_invented_api_stubs(file_content, source_bundle)
+                deterministic_fix = align_junit_framework(file_content, junit_version)
+                deterministic_fix = remove_invented_api_stubs(deterministic_fix, source_bundle)
                 deterministic_fix = rewrite_interface_mocks_to_concrete(
                     deterministic_fix, runtime_related_sources
+                )
+                deterministic_fix = repair_int_array_capacity_for_runtime_errors(
+                    deterministic_fix, stack_trace
+                )
+                deterministic_fix = repair_runtime_semantic_mismatches(
+                    deterministic_fix, stack_trace, runtime_source_text
                 )
                 if deterministic_fix != file_content:
                     deterministic_fix = enforce_test_class_name(deterministic_fix, test_class)
@@ -1679,9 +1718,16 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                     continue
 
                 fixed_code = enforce_test_class_name(fixed_code, test_class)
+                fixed_code = align_junit_framework(fixed_code, junit_version)
                 fixed_code = ensure_junit_imports(fixed_code, junit_version)
                 fixed_code = remove_invented_api_stubs(fixed_code, source_bundle)
                 fixed_code = rewrite_interface_mocks_to_concrete(fixed_code, runtime_related_sources)
+                fixed_code = repair_int_array_capacity_for_runtime_errors(
+                    fixed_code, stack_trace
+                )
+                fixed_code = repair_runtime_semantic_mismatches(
+                    fixed_code, stack_trace, runtime_source_text
+                )
 
                 failing_path.write_text(fixed_code, encoding="utf-8")
                 runtime_retries[retry_key] = retries + 1
@@ -1800,6 +1846,20 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     runtime_survivors = len(generated_paths)
     runtime_rejected_files = list((demo_root / "rejected" / "runtime").rglob(f"{GENERATED_PREFIX}*Test.java"))
     runtime_rejected = len(runtime_rejected_files)
+    runtime_had_failures = bool(
+        (runtime_counts.get("failures") or 0) > 0 or (runtime_counts.get("errors") or 0) > 0
+    )
+    coverage_from_passing_survivors = bool(
+        coverage and runtime_survivors > 0 and not runtime_had_failures
+    )
+    if coverage_from_passing_survivors:
+        coverage_source = "passing generated tests that survived runtime repair"
+    elif coverage:
+        coverage_source = (
+            "partial JaCoCo data from a runtime execution with failing or rejected tests"
+        )
+    else:
+        coverage_source = "no JaCoCo coverage report"
 
     coverage_quality_issue = None
     if (
@@ -1879,6 +1939,8 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         "rejected_runtime_dir": str((demo_root / "rejected" / "runtime").resolve()),
         "jacoco_exec_found": jacoco_exec_found,
         "coverage": coverage,
+        "coverage_source": coverage_source,
+        "coverage_from_passing_survivors": coverage_from_passing_survivors,
         "coverage_refinement": coverage_refinement,
         "coverage_quality_issue": coverage_quality_issue,
         "tests_run": runtime_counts.get("tests_run"),
