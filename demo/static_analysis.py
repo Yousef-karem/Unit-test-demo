@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -719,6 +720,7 @@ def class_ast_summary(fqcn: str, class_info: Dict) -> str:
                 ctor_jdoc = extract_constructor_javadoc(ctor)
             if ctor_jdoc:
                 _render_method_javadoc(lines, ctor_jdoc, indent="  ")
+    
     
     # ------------------------------------------------------------------
     # Methods (structural signature + full Javadoc per method)
