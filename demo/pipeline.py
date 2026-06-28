@@ -5,16 +5,25 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional, Set
 
 
 
 from demo.config import (
+    DEFAULT_COVERAGE_THRESHOLD,
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
     DEFAULT_DOCKER_MAVEN_IMAGE,
+    DEFAULT_GENERATION_THREADS,
+    DEFAULT_MAX_ITERATION_REFINEMENTS,
+    DEFAULT_MAX_STAGNATION_ITERATIONS,
     DEMO_OUT,
     GENERATED_PATTERN,
     GENERATED_PREFIX,
@@ -43,10 +52,14 @@ from demo.coverage.parse import (
 )
 from demo.coverage.refinement import CoverageRefinement
 from demo.llm.prompt_writer import (
+    OllamaRepairTimeout,
     ollama_repair_test,
     ollama_runtime_repair_test,
-    ollama_write_prompt,
 )
+from demo.prompt_generation.factory import create_prompt_generator
+from demo.prompt_generation.helpers import resolve_related_sources
+from demo.prompt_generation.models import PromptGenerationContext
+from demo.prompt_generation.protocol import PromptGenerator
 from demo.llm.ollama import ollama_generate
 from demo.packages import (
     choose_packages_interactive,
@@ -59,6 +72,7 @@ from demo.test_libraries import detect_junit_version
 from demo.static_analysis import (
     project_type_context_from_analysis,
     related_type_sources_from_analysis,
+    run_incremental_ast_analysis,
     run_ast_analysis,
     targets_from_analysis,
 )
@@ -67,7 +81,6 @@ from demo.utils import (
     ensure_unique_run_class_name,
     ensure_junit_imports,
     enforce_test_class_name,
-    find_concrete_impls,
     load_env_file,
     remove_invented_api_stubs,
     repo_name_from_arg,
@@ -113,68 +126,6 @@ def ensure_unique_test_class_name(base: str, t: Dict, mode: str) -> str:
 # ----------------------------
 
 TYPE_DECL_RE = re.compile(r"\b(class|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
-TYPE_NAME_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\b")
-SKIP_RELATED_TYPES = frozenset(
-    {
-        "String", "Integer", "Boolean", "Long", "Double", "Float", "Short", "Byte",
-        "Character", "Object", "Class", "Void", "Override", "Test", "BeforeEach",
-        "AfterEach", "Mock", "InjectMocks", "Collection", "List", "Map", "Set",
-        "Optional", "Arrays", "Collections", "Assertions",
-    }
-)
-
-
-def collect_related_type_sources(project_root: Path, target: Dict) -> str:
-    own_class = target.get("class_name") or ""
-    text = " ".join(
-        [
-            target.get("signature") or "",
-            target.get("snippet") or "",
-            own_class,
-        ]
-    )
-    related_names = {
-        name for name in TYPE_NAME_RE.findall(text)
-        if name not in SKIP_RELATED_TYPES and name != own_class
-    }
-    if not related_names:
-        return ""
-
-    by_name: Dict[str, str] = {}
-    for f in list_java_files(project_root):
-        if f.stem not in related_names or f.stem in by_name:
-            continue
-        try:
-            rel = f.relative_to(project_root)
-            by_name[f.stem] = f"// {rel}\n{f.read_text(encoding='utf-8', errors='ignore')}"
-        except (OSError, ValueError):
-            continue
-
-    # Pull in concrete classes that implement referenced interfaces.
-    interface_names = [
-        name for name, src in by_name.items()
-        if re.search(rf"\binterface\s+{re.escape(name)}\b", src)
-    ]
-    if interface_names:
-        for f in list_java_files(project_root):
-            if f.stem in by_name:
-                continue
-            try:
-                txt = f.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for iface in interface_names:
-                if re.search(
-                    rf"\bclass\s+{re.escape(f.stem)}\s+implements\s+[^{{;]*\b{re.escape(iface)}\b",
-                    txt,
-                ):
-                    rel = f.relative_to(project_root)
-                    by_name[f.stem] = f"// {rel}\n{txt}"
-                    break
-
-    return "\n\n".join(by_name[name] for name in sorted(by_name))
-
-
 def list_project_types(project_root: Path) -> List[str]:
     types = set()
     for f in list_java_files(project_root):
@@ -312,10 +263,40 @@ def isolate_non_generated_test_files(
         except OSError:
             resolved = test_file
 
-        # Keep generated tests in place.
-        if resolved in generated_set or test_file.name.startswith(GENERATED_PREFIX):
+        # Keep only this run's generated tests in place.
+        if resolved in generated_set:
             continue
 
+        rel = test_file.relative_to(test_root)
+        dest = backup_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(test_file), str(dest))
+        moved.append({"from": str(test_file), "to": str(dest)})
+
+    return moved
+
+
+def isolate_stale_generated_tests(
+    project_root: Path, keep_paths: List[str], backup_root: Path
+) -> List[Dict[str, str]]:
+    """
+    Move LLM_Generated*Test.java files left over from prior runs that are not
+    part of the current run's generated_paths.
+    """
+    test_root = project_root / "src" / "test" / "java"
+    if not test_root.exists():
+        return []
+
+    keep_set = {Path(p).resolve() for p in keep_paths}
+    moved: List[Dict[str, str]] = []
+
+    for test_file in test_root.rglob(f"{GENERATED_PREFIX}*Test.java"):
+        try:
+            resolved = test_file.resolve()
+        except OSError:
+            resolved = test_file
+        if resolved in keep_set:
+            continue
         rel = test_file.relative_to(test_root)
         dest = backup_root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -341,8 +322,8 @@ def isolate_generated_tests_except(
 ) -> Iterator[List[Dict[str, str]]]:
     """
     Temporarily move every generated test except keep_path out of src/test/java.
-    This mirrors CubeTester-style focused refinement: compiler/runtime logs should
-    describe the specific generated test being repaired, not unrelated failures.
+    Temporarily isolate other generated tests so compiler/runtime logs refer only
+    to the specific generated test being repaired, not unrelated failures.
     """
     test_root = project_root / "src" / "test" / "java"
     moved: List[Dict[str, str]] = []
@@ -391,6 +372,86 @@ def concise_error_log(log: str, max_lines: int = 80) -> str:
     ]
     selected = important or lines
     return "\n".join(selected[-max_lines:])
+
+
+def concise_compile_error_log(log: str, failing_path: Path, max_lines: int = 30) -> str:
+    """Extract compile errors scoped to a specific test file for shorter repair prompts."""
+    log = strip_ansi(log)
+    needle = failing_path.name
+    scoped = [line for line in log.splitlines() if needle in line or "[ERROR]" in line]
+    if not scoped:
+        scoped = [
+            line
+            for line in log.splitlines()
+            if "[ERROR]" in line or "cannot find symbol" in line or "error:" in line.lower()
+        ]
+    selected = scoped or log.splitlines()
+    return "\n".join(selected[-max_lines:])
+
+
+def concise_runtime_error_log(
+    log_or_trace: str,
+    class_name: str = "",
+    method_name: str = "",
+    max_lines: int = 30,
+) -> str:
+    """Extract Surefire failure details for a specific test method."""
+    log = strip_ansi(log_or_trace)
+    lines = log.splitlines()
+    if not class_name and not method_name:
+        return concise_error_log(log, max_lines=max_lines)
+
+    simple_class = class_name.rsplit(".", 1)[-1] if class_name else ""
+    selected: List[str] = []
+    capture = False
+    for line in lines:
+        if method_name and (
+            f"{simple_class}.{method_name}" in line
+            or (">>> FAILURE!" in line and method_name in line)
+        ):
+            capture = True
+        elif simple_class and simple_class in line and (
+            "FAILURE" in line or "ERROR" in line or "Exception" in line
+        ):
+            capture = True
+        if capture:
+            selected.append(line)
+            if len(selected) >= max_lines:
+                break
+    if not selected:
+        selected = [
+            line
+            for line in lines
+            if "AssertionError" in line
+            or "Exception" in line
+            or "Failed tests:" in line
+            or "FAILURE" in line
+        ]
+    return "\n".join((selected or lines)[-max_lines:])
+
+
+def count_passed_generated_tests(reports_dir: Path) -> int:
+    """Count passing test cases in LLM_Generated* Surefire reports."""
+    if not reports_dir.exists():
+        return 0
+    import xml.etree.ElementTree as ET
+
+    passed = 0
+    for xml_path in reports_dir.glob("TEST-*.xml"):
+        if GENERATED_PREFIX not in xml_path.name:
+            continue
+        try:
+            tree = ET.parse(str(xml_path))
+        except ET.ParseError:
+            continue
+        root = tree.getroot()
+        for case in root.findall(".//testcase"):
+            classname = case.attrib.get("classname", "")
+            if GENERATED_PREFIX not in classname:
+                continue
+            if case.find("failure") is None and case.find("error") is None:
+                passed += 1
+    return passed
 
 
 def resolve_maven_test_path(project_root: Path, reported_path: Path) -> Path:
@@ -454,6 +515,153 @@ def patch_obsolete_tools_jar_dependency(project_root: Path) -> bool:
     return True
 
 
+@dataclass
+class TargetGenerationResult:
+    index: int
+    test_class: str
+    target: Dict
+    out_path: Optional[str] = None
+    quality_log_entry: Optional[Dict] = None
+    error: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
+def read_changed_java_path_set(path: Path) -> set[str]:
+    changed: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return changed
+    for line in lines:
+        item = line.strip()
+        if not item or item.startswith("#") or not item.endswith(".java"):
+            continue
+        changed.add(item.replace("\\", "/"))
+    return changed
+
+
+def filter_targets_to_changed_files(targets: List[Dict], project_root: Path, changed_files: Path) -> List[Dict]:
+    changed = read_changed_java_path_set(changed_files)
+    if not changed:
+        return targets
+    root = project_root.resolve()
+    filtered: List[Dict] = []
+    for target in targets:
+        source = target.get("source_file")
+        if not source:
+            continue
+        try:
+            rel = Path(source).resolve().relative_to(root).as_posix()
+        except (OSError, ValueError):
+            rel = str(source).replace("\\", "/")
+        if rel in changed:
+            filtered.append(target)
+    return filtered
+
+
+def git_output(project_root: Path, args: List[str]) -> str:
+    p = subprocess.run(
+        ["git", "-C", str(project_root), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if p.returncode != 0:
+        return ""
+    return (p.stdout or "").strip()
+
+
+def current_git_commit(project_root: Path) -> str | None:
+    commit = git_output(project_root, ["rev-parse", "HEAD"])
+    return commit or None
+
+
+def base_commit_from_analysis(path: Path) -> str | None:
+    if path.is_dir():
+        path = path / "manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    commit = data.get("generatedFromCommit")
+    return str(commit) if commit else None
+
+
+def latest_previous_analysis_base(repo_name: str, current_run_root: Path) -> Path | None:
+    runs_root = DEMO_OUT / repo_name / "runs"
+    if not runs_root.is_dir():
+        return None
+    candidates: List[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        try:
+            if path.resolve().is_relative_to(current_run_root.resolve()):
+                return
+        except (OSError, ValueError):
+            pass
+        candidates.append(path)
+
+    # Prefer package-sharded analysis because it scales better and is the normal
+    # artifact when --analysis-full-output is disabled.
+    for manifest in runs_root.glob("*/DemoTestCases/*-shards/manifest.json"):
+        add_candidate(manifest.parent)
+    for path in runs_root.glob("*/DemoTestCases/analysis.json"):
+        add_candidate(path)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def resolve_incremental_base_analysis(args, repo_name: str, run_root: Path) -> Path:
+    explicit = getattr(args, "analysis_base", None)
+    if explicit:
+        return Path(explicit)
+    detected = latest_previous_analysis_base(repo_name, run_root)
+    if detected is None:
+        raise RuntimeError(
+            "--analysis-incremental needs a base analysis. Pass --analysis-base, "
+            "or run one AST analysis first so package shards exist."
+        )
+    print(f"Using previous AST base: {detected}")
+    return detected
+
+
+def resolve_incremental_diff_base(args, project_root: Path, base_analysis: Path) -> str:
+    explicit = getattr(args, "analysis_diff_base", None)
+    if explicit:
+        return explicit
+    base_commit = base_commit_from_analysis(base_analysis)
+    if base_commit:
+        return base_commit
+    previous = git_output(project_root, ["rev-parse", "--verify", "HEAD~1"])
+    if previous:
+        return previous
+    raise RuntimeError(
+        "Could not infer incremental diff base. Pass --analysis-diff-base "
+        "(for example origin/master, HEAD~1, or a specific commit)."
+    )
+
+
+def write_git_diff_lists(project_root: Path, demo_root: Path, diff_base: str, diff_head: str = "HEAD") -> tuple[Path, Path]:
+    changed_path = demo_root / "changed.txt"
+    deleted_path = demo_root / "deleted.txt"
+    diff_range = diff_base if "..." in diff_base else f"{diff_base}...{diff_head}"
+    changed = git_output(
+        project_root,
+        ["diff", "--name-only", "--diff-filter=ACMRT", diff_range, "--", "*.java"],
+    )
+    deleted = git_output(
+        project_root,
+        ["diff", "--name-only", "--diff-filter=D", diff_range, "--", "*.java"],
+    )
+    changed_path.write_text((changed + "\n") if changed else "", encoding="utf-8")
+    deleted_path.write_text((deleted + "\n") if deleted else "", encoding="utf-8")
+    print(f"Incremental diff range: {diff_range}")
+    print(f"Incremental changed Java files: {len([x for x in changed.splitlines() if x.strip()])}")
+    print(f"Incremental deleted Java files: {len([x for x in deleted.splitlines() if x.strip()])}")
+    return changed_path, deleted_path
+
+
 def looks_like_java_test_file(text: str) -> bool:
     sample = (text or "").lstrip()
     return bool(
@@ -463,61 +671,187 @@ def looks_like_java_test_file(text: str) -> bool:
     )
 
 
-def build_direct_generation_prompt(
-    target: Dict,
-    test_class: str,
-    project_types_text: str,
-    java_version: str,
+def _elapsed_since(start: float) -> float:
+    return round(time.perf_counter() - start, 2)
+
+
+def _print_timing_summary(timing: Dict) -> None:
+    threads = timing.get("generation_threads", 1)
+    targets = timing.get("target_count", 0)
+    print("\nTiming (seconds):")
+    print(f"  Setup:              {timing.get('setup_seconds', 0):.2f}")
+    print(f"  Analysis:           {timing.get('analysis_seconds', 0):.2f}")
+    print(f"  Generation:        {timing.get('generation_seconds', 0):.2f}  ({threads} threads, {targets} targets)")
+    print(f"  Compile/repair:    {timing.get('compile_repair_seconds', 0):.2f}")
+    print(f"  Runtime/coverage:  {timing.get('runtime_coverage_seconds', 0):.2f}")
+    print(f"  Total:            {timing.get('total_seconds', 0):.2f}")
+
+
+def _generate_one_target(
+    *,
+    index: int,
+    total: int,
+    t: Dict,
+    args,
+    project_root: Path,
+    demo_root: Path,
+    rejected_compile_root: Path,
+    ast_analysis,
+    project_java_version: str,
     junit_version: str,
     has_mockito: bool,
-) -> str:
-    pkg = target.get("package") or "(default)"
-    mockito_rule = (
-        "Mockito is available, but do NOT mock domain/value interfaces when a concrete implementation exists. "
-        "Prefer real objects so production code executes."
-        if has_mockito
-        else "Mockito is not available; do not import or use org.mockito, @Mock, when, verify, or MockitoAnnotations."
-    )
-    junit_rule = (
-        "Use org.junit.Test and static org.junit.Assert.*. Do not use JUnit Jupiter."
-        if junit_version == "4"
-        else "Use org.junit.jupiter.api.Test and org.junit.jupiter.api.Assertions.*. Do not use org.junit.Test."
-    )
-    return f"""
-Output ONLY a complete Java test file. No markdown. No explanations.
-Generate test class exactly: {test_class}
-Package: {pkg}
-Target Java version: {java_version}. {java_version_guidance(java_version)}
-Target framework: JUnit {junit_version}. {junit_rule}
-{mockito_rule}
+    project_types: List[str],
+    used_test_class_names: Set[str],
+    name_lock: threading.Lock,
+    print_lock: threading.Lock,
+    prompt_generator: PromptGenerator,
+) -> TargetGenerationResult:
+    worker_start = time.perf_counter()
+    try:
+        project_type_context = (
+            project_type_context_from_analysis(ast_analysis, t)
+            if ast_analysis is not None
+            else list_project_type_context(project_root)
+        )
+        project_types_text = "\n".join(project_type_context[:250]) or ", ".join(project_types[:250])
+        generated = prompt_generator.generate(
+            PromptGenerationContext(
+                target=t,
+                project_root=project_root,
+                ast_analysis=ast_analysis,
+                project_java_version=project_java_version,
+                junit_version=junit_version,
+                has_mockito=has_mockito,
+                project_types_text=project_types_text,
+                target_mode=args.mode,
+            )
+        )
 
-Hard rules:
-- Every @Test must call real production code from target class {target.get("class_name")}.
-- Do not mock the class under test.
-- For interface parameters, use a concrete implementation from the project type context when present.
-- Do not put null as the first element of arrays unless the test explicitly expects NullPointerException.
-- For Item[] or similar arrays, create non-null concrete Item implementations for all normal-path tests.
-- Use only methods, fields, and constructors shown in the source/AST/project type context.
-- At least 3 @Test methods with concrete assertions.
+        test_class = ensure_unique_test_class_name(generated.test_class_name, t, args.mode)
+        with name_lock:
+            test_class = ensure_unique_run_class_name(test_class, used_test_class_names, index)
+            used_test_class_names.add(test_class)
 
-Target:
-- class: {target.get("class_name")}
-- method: {target.get("method_name") or "(class mode)"}
-- signature: {target.get("signature") or "(entire class)"}
+        (demo_root / "prompts" / f"{test_class}.json").write_text(
+            json.dumps(
+                {
+                    "test_class_name": test_class,
+                    "prompt": generated.prompt,
+                    **generated.metadata,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
-Source/AST summary:
-{target.get("snippet") or ""}
+        with print_lock:
+            print(f"[{index}/{total}] Generating {test_class} ...")
 
-Project type context:
-{project_types_text}
-""".strip()
+        related_sources = resolve_related_sources(project_root, ast_analysis, t)
+        base_prompt = generated.prompt
+        prompt_text = (
+            f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
+            f"Target Java version: {project_java_version}. "
+            f"{java_version_guidance(project_java_version)}\n\n{base_prompt}"
+        )
+        code = ""
+        invalid_reason = ""
+        out_path: Optional[Path] = None
+        use_generation_compile_gate = not getattr(args, "skip_generation_compile_gate", True)
+        source_bundle = f"{related_sources}\n{t.get('snippet') or ''}"
+        for attempt in range(3):
+            code = sanitize_java_output(ollama_generate(args.ollama_model, prompt_text))
+            code = enforce_test_class_name(code, test_class)
+            code = ensure_junit_imports(code, junit_version)
+            code = remove_invented_api_stubs(code, source_bundle)
+            code = rewrite_interface_mocks_to_concrete(code, related_sources)
+            invalid_reason = (
+                validate_java_test_output(code, test_class)
+                or validate_junit_framework(code, junit_version)
+                or validate_test_coverage_quality(code, t, related_sources)
+                or ""
+            )
+            if not invalid_reason and not (t.get("test_libraries") or {}).get("mockito", True):
+                if re.search(r"\borg\.mockito\b|@Mock\b|@InjectMocks\b|\bMockito\b|\bwhen\s*\(", code):
+                    invalid_reason = (
+                        f"project has no Mockito dependency; rewrite as plain JUnit {junit_version} with no Mockito"
+                    )
+            if not invalid_reason and use_generation_compile_gate:
+                with print_lock:
+                    print(f"[{index}/{total}] Compile gate: {test_class} ...")
+                trial_path = write_test_file(project_root, t["package"], test_class, code)
+                compile_log, compile_rc = run_maven_test_compile(project_root, test_filter=test_class)
+                if compile_rc != 0:
+                    tail = concise_compile_error_log(compile_log, trial_path, max_lines=15)
+                    invalid_reason = f"compilation failed:\n{tail}"
+                    try:
+                        trial_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                else:
+                    out_path = trial_path
+                    break
+            elif not invalid_reason:
+                break
+            prompt_text = (
+                f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
+                f"Target Java version: {project_java_version}. "
+                f"{java_version_guidance(project_java_version)}\n\n{base_prompt}\n\n"
+                f"Previous output was invalid because: {invalid_reason}. "
+                "Return ONLY the complete Java test file, with no markdown or explanation."
+            )
+
+        (demo_root / "generated" / f"{test_class}.java").write_text(code, encoding="utf-8")
+        if invalid_reason:
+            rel = Path(t["package"].replace(".", "/")) / f"{test_class}.java" if t["package"] else Path(f"{test_class}.java")
+            dest = rejected_compile_root / "invalid_generation" / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(code, encoding="utf-8")
+            (dest.with_suffix(".txt")).write_text(invalid_reason, encoding="utf-8")
+            elapsed = _elapsed_since(worker_start)
+            return TargetGenerationResult(
+                index=index,
+                test_class=test_class,
+                target=t,
+                quality_log_entry={
+                    "test_class": test_class,
+                    "target": t,
+                    "reason": invalid_reason,
+                    "action": "rejected_invalid_generation",
+                    "elapsed_seconds": elapsed,
+                },
+                elapsed_seconds=elapsed,
+            )
+
+        out_path = out_path or write_test_file(project_root, t["package"], test_class, code)
+        return TargetGenerationResult(
+            index=index,
+            test_class=test_class,
+            target=t,
+            out_path=str(out_path),
+            elapsed_seconds=_elapsed_since(worker_start),
+        )
+    except Exception as exc:
+        return TargetGenerationResult(
+            index=index,
+            test_class="",
+            target=t,
+            error=str(exc),
+            elapsed_seconds=_elapsed_since(worker_start),
+        )
 
 
 # ----------------------------
 # Pipeline
 # ----------------------------
 
-def run_pipeline(args) -> None:
+def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
+    prompt_gen = prompt_generator or create_prompt_generator(args)
+    run_started = time.perf_counter()
+    started_at = datetime.now().isoformat(timespec="seconds")
+    stage_started = run_started
+    timing: Dict[str, float] = {}
+
     # 1) Per-repo run root + clone/open repo
     DEMO_OUT.mkdir(exist_ok=True)
     repo_name = repo_name_from_arg(args.repo)
@@ -538,7 +872,14 @@ def run_pipeline(args) -> None:
     (demo_root / "rejected" / "compile").mkdir(parents=True, exist_ok=True)
     (demo_root / "rejected" / "runtime").mkdir(parents=True, exist_ok=True)
     rejected_compile_root = demo_root / "rejected" / "compile"
-    max_refinement_iterations = max(0, int(getattr(args, "max_refinement_iterations", 5)))
+    max_refinement_iterations = max(
+        0,
+        int(getattr(args, "max_refinement_iterations", DEFAULT_MAX_ITERATION_REFINEMENTS)),
+    )
+    max_stagnation_iterations = max(
+        0,
+        int(getattr(args, "max_stagnation_iterations", DEFAULT_MAX_STAGNATION_ITERATIONS)),
+    )
 
     # 2) Detect build system
     build = args.build
@@ -587,28 +928,68 @@ def run_pipeline(args) -> None:
     elif args.packages and args.packages.strip().upper() != "ALL":
         selected = [p.strip() for p in args.packages.split(",") if p.strip()] or ["*"]
 
+    timing["setup_seconds"] = _elapsed_since(stage_started)
+    stage_started = time.perf_counter()
+
     # 4) Collect targets
     analysis_mode = getattr(args, "analysis_mode", "ast")
     ast_analysis: Dict | None = None
+    resolved_analysis_base: str | None = None
+    resolved_changed_files: str | None = None
+    resolved_deleted_files: str | None = None
+    resolved_diff_base: str | None = None
     if analysis_mode == "ast":
         analysis_path = demo_root / "analysis.json"
         analyzer_jar = Path(args.analyzer_jar) if getattr(args, "analyzer_jar", None) else None
+        analysis_incremental = bool(getattr(args, "analysis_incremental", False))
+        current_commit = current_git_commit(project_root)
         analysis_shards_dir = (
             Path(args.analysis_shards_dir).resolve()
             if getattr(args, "analysis_shards_dir", None)
             else demo_root / f"{repo_name}-shards"
         )
-        ast_analysis = run_ast_analysis(
-            project_root=project_root,
-            output_path=analysis_path,
-            analyzer_jar=analyzer_jar,
-            classpath=getattr(args, "analysis_classpath", None),
-            output_dir=analysis_shards_dir,
-            threads=getattr(args, "analysis_threads", None),
-            batch_size=getattr(args, "analysis_batch_size", None),
-            ast_tree=getattr(args, "analysis_ast_tree", None),
-            full_output=getattr(args, "analysis_full_output", True),
-        )
+        if analysis_incremental:
+            base_analysis_path = resolve_incremental_base_analysis(args, repo_name, run_root)
+            resolved_analysis_base = str(base_analysis_path)
+            changed_files_arg = getattr(args, "analysis_changed_files", None)
+            deleted_files_arg = getattr(args, "analysis_deleted_files", None)
+            if changed_files_arg:
+                changed_files_path = Path(changed_files_arg)
+                deleted_files_path = Path(deleted_files_arg) if deleted_files_arg else None
+            else:
+                diff_base = resolve_incremental_diff_base(args, project_root, base_analysis_path)
+                resolved_diff_base = diff_base
+                changed_files_path, deleted_files_path = write_git_diff_lists(project_root, demo_root, diff_base)
+            resolved_changed_files = str(changed_files_path)
+            resolved_deleted_files = str(deleted_files_path) if deleted_files_path else None
+            ast_analysis = run_incremental_ast_analysis(
+                project_root=project_root,
+                output_path=analysis_path,
+                base_analysis=base_analysis_path,
+                changed_files=changed_files_path,
+                deleted_files=deleted_files_path,
+                analyzer_jar=analyzer_jar,
+                classpath=getattr(args, "analysis_classpath", None),
+                output_dir=analysis_shards_dir,
+                threads=getattr(args, "analysis_threads", None),
+                batch_size=getattr(args, "analysis_batch_size", None),
+                ast_tree=getattr(args, "analysis_ast_tree", None),
+                commit=current_commit,
+                full_output=getattr(args, "analysis_full_output", True),
+            )
+        else:
+            ast_analysis = run_ast_analysis(
+                project_root=project_root,
+                output_path=analysis_path,
+                analyzer_jar=analyzer_jar,
+                classpath=getattr(args, "analysis_classpath", None),
+                output_dir=analysis_shards_dir,
+                threads=getattr(args, "analysis_threads", None),
+                batch_size=getattr(args, "analysis_batch_size", None),
+                ast_tree=getattr(args, "analysis_ast_tree", None),
+                commit=current_commit,
+                full_output=getattr(args, "analysis_full_output", True),
+            )
         targets = targets_from_analysis(
             analysis=ast_analysis,
             project_root=project_root,
@@ -618,6 +999,12 @@ def run_pipeline(args) -> None:
             max_targets=args.max_targets,
             skip_framework_classes=args.skip_framework_classes,
         )
+        if analysis_incremental:
+            targets = filter_targets_to_changed_files(
+                targets,
+                project_root,
+                changed_files_path,
+            )
     else:
         java_files = list_java_files(project_root)
         java_files = [f for f in java_files if file_in_selected_packages(f, project_root, selected)]
@@ -645,6 +1032,9 @@ def run_pipeline(args) -> None:
     if not targets:
         raise RuntimeError("No targets found (check src/main/java and selected packages).")
 
+    timing["analysis_seconds"] = _elapsed_since(stage_started)
+    stage_started = time.perf_counter()
+
     has_mockito = project_has_mockito(project_root)
     for t in targets:
         t["test_libraries"] = {
@@ -661,8 +1051,19 @@ def run_pipeline(args) -> None:
         "resolved_junit_version": junit_version,
         "selected_packages": selected,
         "models": {"ollama": args.ollama_model, "gpt": args.gpt_model},
+        "prompt_mode": getattr(args, "prompt_mode", "llm"),
         "analysis_mode": analysis_mode,
+        "analysis_incremental": bool(getattr(args, "analysis_incremental", False)),
+        "analysis_base": getattr(args, "analysis_base", None),
+        "analysis_changed_files": getattr(args, "analysis_changed_files", None),
+        "analysis_deleted_files": getattr(args, "analysis_deleted_files", None),
+        "analysis_diff_base": getattr(args, "analysis_diff_base", None),
+        "resolved_analysis_base": resolved_analysis_base,
+        "resolved_analysis_changed_files": resolved_changed_files,
+        "resolved_analysis_deleted_files": resolved_deleted_files,
+        "resolved_analysis_diff_base": resolved_diff_base,
         "max_refinement_iterations": max_refinement_iterations,
+        "max_stagnation_iterations": max_stagnation_iterations,
         "test_libraries": {"junit": junit_version, "mockito": has_mockito},
     }
     (demo_root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -676,120 +1077,90 @@ def run_pipeline(args) -> None:
     used_test_class_names: set[str] = set()
 
     project_types = list_project_types(project_root)
+    project_types_text = (
+        "\n".join(list_project_type_context(project_root)[:250])
+        or ", ".join(project_types[:250])
+    )
     generation_quality_log: List[Dict] = []
 
-    for i, t in enumerate(targets, 1):
-        project_type_context = (
-            project_type_context_from_analysis(ast_analysis, t)
-            if ast_analysis is not None
-            else list_project_type_context(project_root)
-        )
-        # Keep prompt context package-local when sharded, and bounded either way.
-        project_types_text = "\n".join(project_type_context[:250]) or ", ".join(project_types[:250])
-        g = ollama_write_prompt(args.gpt_model, t, project_types_text, java_version=project_java_version)
+    generation_threads = max(
+        1,
+        getattr(args, "generation_threads", DEFAULT_GENERATION_THREADS) or DEFAULT_GENERATION_THREADS,
+    )
+    name_lock = threading.Lock()
+    print_lock = threading.Lock()
+    total_targets = len(targets)
+    generation_elapsed: List[float] = []
 
-        test_class = g.get("test_class_name", "")
-        test_class = ensure_unique_test_class_name(test_class, t, args.mode)
-        test_class = ensure_unique_run_class_name(test_class, used_test_class_names, i)
-        used_test_class_names.add(test_class)
-
-        test_target_map[test_class] = t
-
-        (demo_root / "prompts" / f"{test_class}.json").write_text(
-            json.dumps({"test_class_name": test_class, "prompt": g["prompt"]}, indent=2),
-            encoding="utf-8",
-        )
-
-        print(f"[{i}/{len(targets)}] Generating {test_class} ...")
-        related_sources = (
-            related_type_sources_from_analysis(ast_analysis, t)
-            if ast_analysis is not None
-            else collect_related_type_sources(project_root, t)
-        )
-        base_prompt = g.get("prompt", "")
-        if looks_like_java_test_file(base_prompt):
-            base_prompt = build_direct_generation_prompt(
-                target=t,
-                test_class=test_class,
-                project_types_text=project_types_text,
-                java_version=project_java_version,
+    with ThreadPoolExecutor(max_workers=generation_threads) as pool:
+        futures = [
+            pool.submit(
+                _generate_one_target,
+                index=i,
+                total=total_targets,
+                t=t,
+                args=args,
+                project_root=project_root,
+                demo_root=demo_root,
+                rejected_compile_root=rejected_compile_root,
+                ast_analysis=ast_analysis,
+                project_java_version=project_java_version,
                 junit_version=junit_version,
                 has_mockito=has_mockito,
+                project_types=project_types,
+                used_test_class_names=used_test_class_names,
+                name_lock=name_lock,
+                print_lock=print_lock,
+                prompt_generator=prompt_gen,
             )
-        if related_sources:
-            impl_hints: List[str] = []
-            sig_text = t.get("signature") or ""
-            for type_name in TYPE_NAME_RE.findall(sig_text):
-                for impl in find_concrete_impls(related_sources, type_name):
-                    impl_hints.append(
-                        f"For `{type_name}` parameters, use `new {impl}(...)` — do NOT @Mock `{type_name}`."
-                    )
-            base_prompt = (
-                f"{base_prompt}\n\n"
-                "Related type sources (use ONLY APIs shown here; do not invent methods):\n"
-                f"{related_sources}"
-            )
-            if impl_hints:
-                base_prompt += "\n\n" + "\n".join(dict.fromkeys(impl_hints))
-        prompt_text = (
-            f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
-            f"Target Java version: {project_java_version}. "
-            f"{java_version_guidance(project_java_version)}\n\n{base_prompt}"
-        )
-        code = ""
-        invalid_reason = ""
-        source_bundle = f"{related_sources}\n{t.get('snippet') or ''}"
-        for attempt in range(3):
-            code = sanitize_java_output(ollama_generate(args.ollama_model, prompt_text))
-            code = enforce_test_class_name(code, test_class)
-            code = ensure_junit_imports(code, junit_version)
-            code = remove_invented_api_stubs(code, source_bundle)
-            code = rewrite_interface_mocks_to_concrete(code, related_sources)
-            invalid_reason = (
-                validate_java_test_output(code, test_class)
-                or validate_junit_framework(code, junit_version)
-                or validate_test_coverage_quality(code, t, related_sources)
-                or ""
-            )
-            if not invalid_reason and not (t.get("test_libraries") or {}).get("mockito", True):
-                if re.search(r"\borg\.mockito\b|@Mock\b|@InjectMocks\b|\bMockito\b|\bwhen\s*\(", code):
-                    invalid_reason = (
-                        f"project has no Mockito dependency; rewrite as plain JUnit {junit_version} with no Mockito"
-                    )
-            if not invalid_reason:
-                break
-            prompt_text = (
-                f"Generate a JUnit {junit_version} test class named exactly `{test_class}`.\n"
-                f"Target Java version: {project_java_version}. "
-                f"{java_version_guidance(project_java_version)}\n\n{base_prompt}\n\n"
-                f"Previous output was invalid because: {invalid_reason}. "
-                "Return ONLY the complete Java test file, with no markdown or explanation."
-            )
+            for i, t in enumerate(targets, 1)
+        ]
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result.elapsed_seconds is not None:
+                generation_elapsed.append(result.elapsed_seconds)
+            if result.error:
+                generation_quality_log.append(
+                    {
+                        "test_class": result.test_class or f"target_{result.index}",
+                        "target": result.target,
+                        "reason": result.error,
+                        "action": "generation_exception",
+                        "elapsed_seconds": result.elapsed_seconds,
+                    }
+                )
+                with print_lock:
+                    print(f"[{result.index}/{total_targets}] Generation failed: {result.error}")
+                continue
+            if result.test_class:
+                test_target_map[result.test_class] = result.target
+            if result.quality_log_entry:
+                generation_quality_log.append(result.quality_log_entry)
+            elif result.out_path:
+                generated_paths.append(result.out_path)
 
-        (demo_root / "generated" / f"{test_class}.java").write_text(code, encoding="utf-8")
-        if invalid_reason:
-            rel = Path(t["package"].replace(".", "/")) / f"{test_class}.java" if t["package"] else Path(f"{test_class}.java")
-            dest = rejected_compile_root / "invalid_generation" / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(code, encoding="utf-8")
-            (dest.with_suffix(".txt")).write_text(invalid_reason, encoding="utf-8")
-            generation_quality_log.append(
-                {
-                    "test_class": test_class,
-                    "target": t,
-                    "reason": invalid_reason,
-                    "action": "rejected_invalid_generation",
-                }
-            )
-            continue
-
-        out_path = write_test_file(project_root, t["package"], test_class, code)
-        generated_paths.append(str(out_path))
+    timing["generation_seconds"] = _elapsed_since(stage_started)
+    if generation_elapsed:
+        timing["generation_seconds_avg"] = round(sum(generation_elapsed) / len(generation_elapsed), 2)
+        timing["generation_seconds_max"] = round(max(generation_elapsed), 2)
+    print(
+        f"\nGeneration finished in {timing['generation_seconds']:.2f}s "
+        f"({generation_threads} threads, {total_targets} targets)"
+    )
+    stage_started = time.perf_counter()
 
     written_paths = list(generated_paths)
     (demo_root / "written_paths.json").write_text(json.dumps(written_paths, indent=2), encoding="utf-8")
     (demo_root / "generation_quality_log.json").write_text(
         json.dumps(generation_quality_log, indent=2), encoding="utf-8"
+    )
+
+    stale_root = demo_root / "isolation" / "stale_generated_tests"
+    stale_moved = isolate_stale_generated_tests(project_root, generated_paths, stale_root)
+    if stale_moved:
+        print(f"Isolated {len(stale_moved)} stale LLM_Generated test files from prior runs.")
+    (demo_root / "isolation" / "stale_moved_tests.json").write_text(
+        json.dumps(stale_moved, indent=2), encoding="utf-8"
     )
 
     # Isolate pre-existing non-generated tests so compile/runtime can focus on
@@ -809,6 +1180,7 @@ def run_pipeline(args) -> None:
     compile_gate_log: List[Dict] = []
     repair_log: List[Dict] = []
     retry_counts: Dict[str, int] = {}
+    compile_repair_attempts = 0
     compile_blocked = False
     compile_blocked_reason = ""
 
@@ -835,10 +1207,16 @@ def run_pipeline(args) -> None:
 
     # --- Phase A: focused compile refinement ---
     print("Running Maven with RAT, Checkstyle, and Enforcer skipped for coverage-only execution.")
-    for _ in range(max(1, len(generated_paths) * (max_refinement_iterations + 1))):
+    compile_loop_limit = max(1, len(generated_paths) * (max_refinement_iterations + 1))
+    compile_attempt = 0
+    for compile_iter in range(compile_loop_limit):
+        compile_attempt += 1
+        print(
+            f"Compile attempt {compile_attempt}/{compile_loop_limit}: mvn test-compile ...",
+            flush=True,
+        )
         last_compile_log, compile_rc = run_maven_test_compile(project_root)
 
-        # FIX #1: always append compile log during REPAIR phase too
         with compile_log_path.open("a", encoding="utf-8") as f:
             f.write(last_compile_log)
             f.write("\n" + ("-" * 80) + "\n")
@@ -855,7 +1233,10 @@ def run_pipeline(args) -> None:
             break
         failing_path = resolve_maven_test_path(project_root, failing_path)
 
-        # save "before repair" artifacts
+        print(
+            f"Focused compile for {failing_path.name} ...",
+            flush=True,
+        )
         with isolate_generated_tests_except(
             project_root,
             failing_path,
@@ -867,31 +1248,12 @@ def run_pipeline(args) -> None:
         if focused_compile_rc != 0:
             last_compile_log = focused_compile_log
 
+        compile_errors_for_repair = concise_compile_error_log(last_compile_log, failing_path)
         write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_before")
 
         fp = str(failing_path)
         retries = retry_counts.get(fp, 0)
 
-        # exceeded retries -> move to rejected so summaries and artifacts reflect it.
-        if retries >= max_refinement_iterations:
-            write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
-            moved_to = move_to_rejected_compile(
-                failing_path,
-                last_compile_log,
-                action=f"deleted_after_{max_refinement_iterations}_repairs",
-            )
-            repair_log.append(
-                {
-                    "file": fp,
-                    "moved_to": moved_to,
-                    "errors_tail": concise_error_log(last_compile_log),
-                    "action": f"deleted_after_{max_refinement_iterations}_repairs",
-                }
-            )
-            generated_paths = [p for p in generated_paths if Path(p).exists()]
-            continue
-
-        # attempt GPT repair
         try:
             file_content = failing_path.read_text(encoding="utf-8", errors="ignore")
         except FileNotFoundError:
@@ -913,38 +1275,70 @@ def run_pipeline(args) -> None:
             except OSError:
                 pass
 
-        related_sources = (
-            related_type_sources_from_analysis(ast_analysis, target)
-            if ast_analysis is not None
-            else collect_related_type_sources(project_root, target)
-        )
+        related_sources = resolve_related_sources(project_root, ast_analysis, target)
         source_bundle = f"{related_sources}\n{source_text}"
         stub_fixed = remove_invented_api_stubs(file_content, source_bundle)
         stub_fixed = rewrite_interface_mocks_to_concrete(stub_fixed, related_sources)
         stub_fixed = add_throws_exception_to_test_methods(stub_fixed, last_compile_log)
         if stub_fixed != file_content:
             failing_path.write_text(stub_fixed, encoding="utf-8")
+            compile_repair_attempts += 1
             repair_log.append(
                 {
                     "file": fp,
                     "action": "deterministic_stub_removal",
-                    "errors_tail": concise_error_log(last_compile_log, max_lines=20),
+                    "errors_tail": concise_compile_error_log(last_compile_log, failing_path, max_lines=20),
                 }
             )
             continue
 
-        fixed_code = ollama_repair_test(
-            model=args.gpt_model,
-            compiler_errors=last_compile_log,
-            file_content=file_content,
-            source_text=source_text,
-            package_imports=package_imports,
-            constructor_info=constructor_info,
-            repository_types=repo_types_text,
-            related_type_sources=related_sources,
-            java_version=project_java_version,
-            junit_version=junit_version,
+        if max_refinement_iterations == 0 or retries >= max_refinement_iterations:
+            write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
+            action = (
+                "rejected_no_llm_repair"
+                if max_refinement_iterations == 0
+                else f"deleted_after_{max_refinement_iterations}_repairs"
+            )
+            moved_to = move_to_rejected_compile(failing_path, last_compile_log, action=action)
+            repair_log.append(
+                {
+                    "file": fp,
+                    "moved_to": moved_to,
+                    "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
+                    "action": action,
+                }
+            )
+            generated_paths = [p for p in generated_paths if Path(p).exists()]
+            continue
+
+        print(
+            f"Repairing {test_class} via LLM (attempt {retries + 1}/{max_refinement_iterations}) ...",
+            flush=True,
         )
+        try:
+            fixed_code = ollama_repair_test(
+                model=args.gpt_model,
+                compiler_errors=compile_errors_for_repair,
+                file_content=file_content,
+                source_text=source_text,
+                package_imports=package_imports,
+                constructor_info=constructor_info,
+                repository_types=repo_types_text,
+                related_type_sources=related_sources,
+                java_version=project_java_version,
+                junit_version=junit_version,
+            )
+        except OllamaRepairTimeout as exc:
+            retry_counts[fp] = retries + 1
+            compile_repair_attempts += 1
+            repair_log.append(
+                {
+                    "file": fp,
+                    "action": "repair_timeout",
+                    "errors_tail": str(exc),
+                }
+            )
+            continue
 
         fixed_code = enforce_test_class_name(fixed_code, test_class)
         fixed_code = ensure_junit_imports(fixed_code, junit_version)
@@ -956,11 +1350,12 @@ def run_pipeline(args) -> None:
         if not fixed_code.strip() or invalid_fix_reason:
             write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
             retry_counts[fp] = retries + 1
+            compile_repair_attempts += 1
             repair_log.append(
                 {
                     "file": fp,
                     "invalid_fix_reason": invalid_fix_reason,
-                    "errors_tail": concise_error_log(last_compile_log),
+                    "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
                     "action": "invalid_or_empty_fix",
                 }
             )
@@ -968,10 +1363,11 @@ def run_pipeline(args) -> None:
 
         failing_path.write_text(fixed_code, encoding="utf-8")
         retry_counts[fp] = retries + 1
+        compile_repair_attempts += 1
         repair_log.append(
             {
                 "file": fp,
-                "errors_tail": concise_error_log(last_compile_log),
+                "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
                 "action": "fixed",
             }
         )
@@ -984,7 +1380,10 @@ def run_pipeline(args) -> None:
     generated_paths = [p for p in generated_paths if Path(p).exists()]
 
     # --- Phase B: Compile gate loop (move remaining failing tests) ---
+    compile_gate_attempt = 0
     for _ in range(10):
+        compile_gate_attempt += 1
+        print(f"Compile gate {compile_gate_attempt}/10: mvn test-compile ...", flush=True)
         last_compile_log, compile_rc = run_maven_test_compile(project_root)
 
         with compile_log_path.open("a", encoding="utf-8") as f:
@@ -1020,6 +1419,9 @@ def run_pipeline(args) -> None:
     compile_rejected_files = list((demo_root / "rejected" / "compile").rglob(f"{GENERATED_PREFIX}*Test.java"))
     compile_rejected = len(compile_rejected_files)
 
+    timing["compile_repair_seconds"] = _elapsed_since(stage_started)
+    stage_started = time.perf_counter()
+
     early_stop = (compile_survivors == 0) or compile_blocked
 
     # 7) Runtime stage: run tests with JaCoCo agent; runtime repair on failures
@@ -1031,12 +1433,23 @@ def run_pipeline(args) -> None:
     runtime_gate_log: List[Dict] = []
     runtime_repair_log: List[Dict] = []
     runtime_retries: Dict[str, int] = {}
+    runtime_repair_attempts = 0
+    tests_passed_first_run: Optional[int] = None
+    tests_passed_after_repair: Optional[int] = None
+    runtime_rejected_details: List[Dict] = []
     rejected_runtime_root = demo_root / "rejected" / "runtime"
 
     if not early_stop:
         print("\nRuntime stage: running ONLY generated tests with JaCoCo agent")
 
-        def move_to_rejected_runtime(failing_path: Path, errors: str, action: str) -> None:
+        def move_to_rejected_runtime(
+            failing_path: Path,
+            errors: str,
+            action: str,
+            *,
+            method_name: str = "",
+            iterations: int = 0,
+        ) -> None:
             try:
                 rel = failing_path.relative_to(project_root)
             except ValueError:
@@ -1047,18 +1460,43 @@ def run_pipeline(args) -> None:
                 shutil.move(str(failing_path), str(dest))
             except FileNotFoundError:
                 return
+            trimmed = concise_runtime_error_log(
+                errors,
+                class_name=failing_path.stem,
+                method_name=method_name,
+            )
+            failed_txt = dest.with_suffix(".failed.txt")
+            failed_txt.write_text(
+                f"action={action}\niterations={iterations}\nmethod={method_name or '*'}\n\n{trimmed}",
+                encoding="utf-8",
+            )
             runtime_gate_log.append(
                 {
                     "file": str(failing_path),
                     "moved_to": str(dest),
                     "action": action,
-                    "errors_tail": "\n".join(strip_ansi(errors).splitlines()[-80:]),
+                    "method": method_name or None,
+                    "iterations": iterations,
+                    "errors_tail": trimmed,
                 }
             )
 
-        for _ in range(max(1, len(generated_paths) * (max_refinement_iterations + 1))):
+        runtime_loop_limit = max(1, len(generated_paths) * (max_refinement_iterations + 1))
+        runtime_attempt = 0
+
+        for runtime_iter in range(runtime_loop_limit):
+            runtime_attempt += 1
+            print(
+                f"Runtime attempt {runtime_attempt}/{runtime_loop_limit}: mvn test ...",
+                flush=True,
+            )
             test_log, test_rc = run_maven_tests(project_root)
             (demo_root / "runtime" / "test_log.txt").write_text(test_log, encoding="utf-8")
+
+            if tests_passed_first_run is None:
+                tests_passed_first_run = count_passed_generated_tests(
+                    project_root / "target" / "surefire-reports"
+                )
 
             failures = extract_runtime_failures(project_root / "target" / "surefire-reports")
             if test_rc == 0 or not failures:
@@ -1080,6 +1518,10 @@ def run_pipeline(args) -> None:
                 test_filter = class_name.rsplit(".", 1)[-1]
                 if method_name:
                     test_filter = f"{test_filter}#{method_name}"
+                print(
+                    f"Focused runtime test {test_filter} ...",
+                    flush=True,
+                )
                 with isolate_generated_tests_except(
                     project_root,
                     failing_path,
@@ -1089,24 +1531,21 @@ def run_pipeline(args) -> None:
                         project_root, test_filter=test_filter
                     )
                 if focused_test_rc != 0:
-                    stack_trace = stack_trace or concise_error_log(focused_test_log)
+                    stack_trace = stack_trace or concise_runtime_error_log(
+                        focused_test_log,
+                        class_name=class_name,
+                        method_name=method_name,
+                    )
+                else:
+                    stack_trace = concise_runtime_error_log(
+                        stack_trace or focused_test_log,
+                        class_name=class_name,
+                        method_name=method_name,
+                    )
 
                 write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_before")
 
                 retries = runtime_retries.get(retry_key, 0)
-                if retries >= max_refinement_iterations:
-                    write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_final")
-                    move_to_rejected_runtime(failing_path, stack_trace, action="rejected")
-                    runtime_repair_log.append(
-                        {
-                            "file": fp,
-                            "method": method_name or None,
-                            "action": "rejected",
-                            "errors_tail": concise_error_log(stack_trace),
-                        }
-                    )
-                    changed_any = True
-                    continue
 
                 try:
                     file_content = failing_path.read_text(encoding="utf-8", errors="ignore")
@@ -1116,11 +1555,7 @@ def run_pipeline(args) -> None:
                 test_class = failing_path.stem
                 target = test_target_map.get(test_class, {})
                 runtime_source_text = ""
-                runtime_related_sources = (
-                    related_type_sources_from_analysis(ast_analysis, target)
-                    if ast_analysis is not None
-                    else collect_related_type_sources(project_root, target)
-                )
+                runtime_related_sources = resolve_related_sources(project_root, ast_analysis, target)
                 src_path = target.get("source_file")
                 if src_path:
                     try:
@@ -1138,38 +1573,106 @@ def run_pipeline(args) -> None:
                     deterministic_fix = ensure_junit_imports(deterministic_fix, junit_version)
                     failing_path.write_text(deterministic_fix, encoding="utf-8")
                     runtime_retries[retry_key] = retries + 1
+                    runtime_repair_attempts += 1
                     runtime_repair_log.append(
                         {
                             "file": fp,
                             "method": method_name or None,
                             "action": "deterministic_runtime_rewrite",
-                            "errors_tail": concise_error_log(stack_trace),
+                            "errors_tail": stack_trace,
                         }
                     )
                     changed_any = True
                     continue
 
-                # FIX #2: keyword call (avoids args/positional confusion)
-                fixed_code = ollama_runtime_repair_test(
-                    model=args.gpt_model,
-                    stack_trace=stack_trace,
-                    file_content=file_content,
-                    failing_method=method_name,
-                    source_text=runtime_source_text,
-                    related_type_sources=runtime_related_sources,
-                    java_version=project_java_version,
-                    junit_version=junit_version,
+                if max_refinement_iterations == 0 or retries >= max_refinement_iterations:
+                    write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_final")
+                    action = (
+                        "rejected_no_llm_repair"
+                        if max_refinement_iterations == 0
+                        else "rejected"
+                    )
+                    move_to_rejected_runtime(
+                        failing_path,
+                        stack_trace,
+                        action=action,
+                        method_name=method_name,
+                        iterations=retries,
+                    )
+                    runtime_repair_log.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": action,
+                            "errors_tail": stack_trace,
+                        }
+                    )
+                    runtime_rejected_details.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": action,
+                            "iterations": retries,
+                            "errors_tail": stack_trace,
+                        }
+                    )
+                    changed_any = True
+                    continue
+
+                print(
+                    f"Repairing {test_class}#{method_name or '*'} via LLM "
+                    f"(attempt {retries + 1}/{max_refinement_iterations}) ...",
+                    flush=True,
                 )
+                try:
+                    fixed_code = ollama_runtime_repair_test(
+                        model=args.gpt_model,
+                        stack_trace=stack_trace,
+                        file_content=file_content,
+                        failing_method=method_name,
+                        source_text=runtime_source_text,
+                        related_type_sources=runtime_related_sources,
+                        java_version=project_java_version,
+                        junit_version=junit_version,
+                    )
+                except OllamaRepairTimeout as exc:
+                    runtime_retries[retry_key] = retries + 1
+                    runtime_repair_attempts += 1
+                    runtime_repair_log.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": "repair_timeout",
+                            "errors_tail": str(exc),
+                        }
+                    )
+                    changed_any = True
+                    continue
 
                 if not fixed_code.strip():
                     write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_final")
-                    move_to_rejected_runtime(failing_path, stack_trace, action="rejected_empty_fix")
+                    move_to_rejected_runtime(
+                        failing_path,
+                        stack_trace,
+                        action="rejected_empty_fix",
+                        method_name=method_name,
+                        iterations=retries + 1,
+                    )
                     runtime_repair_log.append(
                         {
                             "file": fp,
                             "method": method_name or None,
                             "action": "rejected_empty_fix",
-                            "errors_tail": concise_error_log(stack_trace),
+                            "errors_tail": stack_trace,
+                        }
+                    )
+                    runtime_rejected_details.append(
+                        {
+                            "file": fp,
+                            "method": method_name or None,
+                            "action": "rejected_empty_fix",
+                            "iterations": retries + 1,
+                            "errors_tail": stack_trace,
                         }
                     )
                     changed_any = True
@@ -1182,18 +1685,23 @@ def run_pipeline(args) -> None:
 
                 failing_path.write_text(fixed_code, encoding="utf-8")
                 runtime_retries[retry_key] = retries + 1
+                runtime_repair_attempts += 1
                 runtime_repair_log.append(
                     {
                         "file": fp,
                         "method": method_name or None,
                         "action": "fixed",
-                        "errors_tail": concise_error_log(stack_trace),
+                        "errors_tail": stack_trace,
                     }
                 )
                 changed_any = True
 
             if not changed_any:
                 break
+
+        tests_passed_after_repair = count_passed_generated_tests(
+            project_root / "target" / "surefire-reports"
+        )
 
         (demo_root / "runtime" / "runtime_gate_log.json").write_text(
             json.dumps(runtime_gate_log, indent=2), encoding="utf-8"
@@ -1206,13 +1714,23 @@ def run_pipeline(args) -> None:
         report_log, report_rc = run_maven_report(project_root)
 
         xml_after_runtime = project_root / "target" / "site" / "jacoco" / "jacoco.xml"
-        if test_rc == 0 and report_rc == 0 and xml_after_runtime.exists():
+        survivor_paths = [p for p in generated_paths if Path(p).exists()]
+        runtime_coverage_snapshot = (
+            parse_jacoco_xml(xml_after_runtime) if xml_after_runtime.exists() else {}
+        )
+        coverage_below_threshold = bool(runtime_coverage_snapshot) and any(
+            runtime_coverage_snapshot.get(metric, 0.0) < DEFAULT_COVERAGE_THRESHOLD
+            for metric in ("line_coverage", "instruction_coverage", "branch_coverage")
+        )
+        if (
+            report_rc == 0
+            and xml_after_runtime.exists()
+            and survivor_paths
+            and max_refinement_iterations > 0
+            and coverage_below_threshold
+        ):
             def coverage_related_sources(target: Dict) -> str:
-                return (
-                    related_type_sources_from_analysis(ast_analysis, target)
-                    if ast_analysis is not None
-                    else collect_related_type_sources(project_root, target)
-                )
+                return resolve_related_sources(project_root, ast_analysis, target)
 
             refinement = CoverageRefinement(
                 project_root=project_root,
@@ -1222,13 +1740,20 @@ def run_pipeline(args) -> None:
                 junit_version=junit_version,
                 has_mockito=has_mockito,
                 ast_analysis=ast_analysis,
-                generated_paths=[p for p in generated_paths if Path(p).exists()],
+                generated_paths=survivor_paths,
                 test_target_map=test_target_map,
                 related_sources_provider=coverage_related_sources,
                 project_types_text=project_types_text,
+                max_iterations=max_refinement_iterations,
+                max_stagnation=max_stagnation_iterations,
             )
             refinement.run(xml_after_runtime)
             generated_paths = [p for p in generated_paths if Path(p).exists()]
+            tests_passed_after_repair = count_passed_generated_tests(
+                project_root / "target" / "surefire-reports"
+            )
+
+    timing["runtime_coverage_seconds"] = _elapsed_since(stage_started)
 
     # 8) Collect logs
     build_log = (test_log or "") + "\n" + (report_log or "")
@@ -1312,6 +1837,16 @@ def run_pipeline(args) -> None:
             reason = "coverage report not found"
         (demo_root / "coverage" / "no_report_reason.txt").write_text(reason, encoding="utf-8")
 
+    timing["total_seconds"] = _elapsed_since(run_started)
+    finished_at = datetime.now().isoformat(timespec="seconds")
+    timing_summary = {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "generation_threads": generation_threads,
+        "target_count": total_targets,
+        **timing,
+    }
+
     summary = {
         "repo": args.repo,
         "project_root": str(project_root),
@@ -1321,16 +1856,23 @@ def run_pipeline(args) -> None:
         "ollama_model": args.ollama_model,
         "gpt_model": args.gpt_model,
         "max_refinement_iterations": max_refinement_iterations,
+        "max_stagnation_iterations": max_stagnation_iterations,
         "generated_total": len(written_paths) + len(generation_quality_log),
         "generated_written": len(written_paths),
         "generation_rejected": len(generation_quality_log),
         "compile_survivors": compile_survivors,
         "compile_rejected": int(compile_rejected),
+        "compile_repair_attempts": compile_repair_attempts,
         "compile_blocked": compile_blocked,
         "compile_blocked_reason": compile_blocked_reason or None,
         "runtime_survivors": runtime_survivors,
         "runtime_rejected": int(runtime_rejected),
+        "runtime_repair_attempts": runtime_repair_attempts,
+        "runtime_rejected_details": runtime_rejected_details,
+        "tests_passed_first_run": tests_passed_first_run,
+        "tests_passed_after_repair": tests_passed_after_repair,
         "isolated_non_generated_tests": len(isolated_tests),
+        "isolated_stale_generated_tests": len(stale_moved),
         "isolated_tests_manifest": str((demo_root / "isolation" / "moved_tests.json").resolve()),
         "survivor_test_files_in_repo": generated_paths,
         "rejected_compile_dir": str((demo_root / "rejected" / "compile").resolve()),
@@ -1347,6 +1889,7 @@ def run_pipeline(args) -> None:
         if (report_dir / "index.html").exists()
         else None,
         "note": "Tests were written locally into src/test/java but NOT committed or pushed.",
+        "timing": timing_summary,
     }
     (demo_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -1365,3 +1908,13 @@ def run_pipeline(args) -> None:
         print(f"- Line:        {coverage['line_coverage']*100:.2f}%")
         print(f"- Instruction: {coverage['instruction_coverage']*100:.2f}%")
         print(f"- Branch:      {coverage['branch_coverage']*100:.2f}%")
+
+    _print_timing_summary(timing_summary)
+
+
+class Pipeline:
+    def __init__(self, prompt_generator: PromptGenerator) -> None:
+        self._prompt_generator = prompt_generator
+
+    def run(self, args) -> None:
+        run_pipeline(args, prompt_generator=self._prompt_generator)
