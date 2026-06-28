@@ -19,6 +19,19 @@ class OllamaRepairTimeout(RuntimeError):
     """Raised when an Ollama repair request exceeds its timeout."""
 
 
+def _clip_repair_context(text: str, max_chars: int) -> str:
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    keep_head = max_chars // 2
+    keep_tail = max_chars - keep_head
+    return (
+        text[:keep_head].rstrip()
+        + "\n\n// ... repair context truncated ...\n\n"
+        + text[-keep_tail:].lstrip()
+    )
+
+
 def _check_ollama_response(r: requests.Response, model: str) -> None:
     """Raise a clear error when the Ollama model is not found."""
     if r.status_code == 404:
@@ -260,6 +273,10 @@ def ollama_repair_test(
         "You are a senior Java testing expert. "
         f"You fix compilation errors in JUnit {junit_version} tests."
     )
+    compiler_errors = _clip_repair_context(compiler_errors, 5000)
+    file_content = _clip_repair_context(file_content, 14000)
+    source_text = _clip_repair_context(source_text, 16000)
+    related_type_sources = _clip_repair_context(related_type_sources, 18000)
     user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
@@ -288,6 +305,10 @@ Related type sources (only use APIs shown here):
 Instruction: Return corrected Java test file ONLY, keep class name and package, fix typing/import issues, don’t introduce new libraries.
 If compiler errors say org.mockito does not exist, remove every Mockito import/annotation/call and {plain_junit_note}.
 Only call methods and access fields that exist in the related type sources or class under test source. Replace invented methods (e.g. getKey()) with real constructors/fields/APIs from the source.
+If compiler errors say a field is missing on an interface/base type but related sources show one concrete implementation with that public field, cast before reading it (for example `((MeuItem) result).chave`).
+If compiler errors say an invented getter method is missing but the source shows a public field with the same property name, read the field directly.
+If compiler errors say a class symbol is missing, either add the correct import from the related sources/package lines or remove that test idea; do not invent a class.
+Fix the existing test minimally. Preserve tests that already compile and keep every assertion tied to real production behavior.
 Start directly with package/import/class declarations. Do not include markdown fences, headings, bullet lists, or explanations.
 {junit_import_note}
 Do not mock the class or method under test. Each test must call real production code; replace mock-only assertions with real object calls when constructors/source context allow it.
@@ -339,6 +360,10 @@ def ollama_runtime_repair_test(
         f"You fix runtime errors in JUnit {junit_version} tests."
     )
     assertion_guidance = _assertion_error_repair_guidance(stack_trace, source_text)
+    stack_trace = _clip_repair_context(stack_trace, 7000)
+    file_content = _clip_repair_context(file_content, 14000)
+    source_text = _clip_repair_context(source_text, 16000)
+    related_type_sources = _clip_repair_context(related_type_sources, 18000)
     user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
@@ -363,6 +388,9 @@ Related type sources / AST summaries:
 Instruction: Return corrected Java test file ONLY, keep class name and package, fix runtime errors, don’t introduce new libraries.
 If the stack trace shows a NullPointerException from an array element or interface value, replace null/mocked domain values with real concrete instances from related type sources.
 For interface parameters, use concrete implementations and constructors shown above. Do not mock domain/value interfaces when concrete implementations exist.
+If JUnit reports "Expected exception" but the source code does not throw that exception, remove the expected-exception annotation and assert normal behavior instead.
+If a string-search algorithm crashes on an empty pattern (m == 0 / P == ""), change that test to a valid non-empty pattern, preferably a no-match pattern when the test intended no output.
+If a test captures System.out, save `PrintStream originalOut = System.out` before replacing it and restore with `System.setOut(originalOut)`.
 """.strip()
 
     return sanitize_java_output(
