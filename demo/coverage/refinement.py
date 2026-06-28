@@ -218,7 +218,7 @@ class CoverageRefinement:
             prompt_path = (
                 self.demo_root
                 / "coverage_refinement"
-                / f"iteration_{iteration}_prompt.txt"
+                / f"iteration_{iteration}_prompt_{test_path.stem}.txt"
             )
             prompt_path.write_text(prompt, encoding="utf-8")
             
@@ -237,12 +237,12 @@ class CoverageRefinement:
         return appended
 
     def _build_prompt(
-        self,
-        iteration: int,
-        test_path: Path,
-        target: Dict,
-        methods: List[UncoveredMethod],
-        coverage: Dict[str, float],
+    self,
+    iteration: int,
+    test_path: Path,
+    target: Dict,
+    methods: List[UncoveredMethod],
+    coverage: Dict[str, float],
     ) -> str:
         junit_rule = (
             "Use org.junit.Test and static org.junit.Assert assertions."
@@ -250,37 +250,52 @@ class CoverageRefinement:
             else "Use org.junit.jupiter.api.Test and org.junit.jupiter.api.Assertions assertions."
         )
         mockito_rule = (
-            "Mockito is available, but prefer real objects and do not mock the class under test."
+            "Mockito is available. Prefer real objects. Never mock the class under test."
             if self.has_mockito
-            else "Mockito is not available; do not import or use Mockito APIs."
+            else "Mockito is NOT available. Do not import or use any Mockito APIs."
         )
         uncovered_text = self._format_methods(methods)
         existing_names = ", ".join(self._existing_test_method_names(test_path)[:80])
-        return f"""
-Return ONLY compilable Java JUnit test methods. Do not return a class, imports, markdown, or explanations.
 
-Target Java version: {self.java_version}
-Target framework: JUnit {self.junit_version}. {junit_rule}
-{mockito_rule}
+        coverage_gap = {
+            metric: max(0.0, self.threshold - coverage.get(metric, 0.0))
+            for metric in self.metrics
+        }
+        prioritized_methods = uncovered_text  # assumed already sorted by _format_methods
 
-Hard rules:
-- Do NOT modify existing tests.
-- Do NOT regenerate existing tests.
-- Generate only new tests that target the uncovered code.
-- Focus only on the uncovered instructions, branches, and lines.
-- Return only compilable Java JUnit test methods.
-- Do not duplicate these existing test method names: {existing_names or "(none)"}.
-- Name new methods with this prefix: coverageRefinement{iteration}_.
-- Every @Test method must execute real production code from the target class.
+        return f"""You are a Java test engineer. Your only job is to write new JUnit test methods that cover uncovered code.
 
-Current coverage:
-- line coverage: {coverage.get("line", 0.0)*100:.2f}%
-- instruction coverage: {coverage.get("instruction", 0.0)*100:.2f}%
-- branch coverage: {coverage.get("branch", 0.0)*100:.2f}%
-Coverage target: {self.threshold*100:.2f}% for {", ".join(self.metrics)}
+### Environment
+- Java version: {self.java_version}
+- JUnit version: {self.junit_version} — {junit_rule}
+- Mockito: {mockito_rule}
 
-Highest-priority uncovered behaviors:
-{uncovered_text}
+### Strict output rules (violations will cause a compile error)
+1. Output ONLY bare Java test method bodies — no class declaration, no imports, no markdown, no explanation.
+2. Every method MUST be annotated with @Test.
+3. Every method MUST call real production code from the class under test.
+4. Method names MUST start with: coverageRefinement{iteration}_
+5. Do NOT reproduce or rename any of these existing methods: {existing_names or "(none)"}
+
+### Coverage status
+| Metric      | Current | Target | Gap |
+|-------------|---------|--------|-----|
+| Line        | {coverage.get("line", 0.0)*100:.1f}%  | {self.threshold*100:.1f}% | {coverage_gap.get("line", 0.0)*100:.1f}% |
+| Instruction | {coverage.get("instruction", 0.0)*100:.1f}%  | {self.threshold*100:.1f}% | {coverage_gap.get("instruction", 0.0)*100:.1f}% |
+| Branch      | {coverage.get("branch", 0.0)*100:.1f}%  | {self.threshold*100:.1f}% | {coverage_gap.get("branch", 0.0)*100:.1f}% |
+
+Focus on closing the gaps above. Prioritize branch coverage — each uncovered branch requires a dedicated test.
+
+### Uncovered code (highest priority first)
+{prioritized_methods}
+
+### Output format — one method per block, no blank lines between annotation and signature
+@Test
+public void coverageRefinement{iteration}_<descriptiveName>() {{
+    // arrange
+    // act
+    // assert
+}}
 """.strip()
 
     def _format_methods(self, methods: List[UncoveredMethod]) -> str:
