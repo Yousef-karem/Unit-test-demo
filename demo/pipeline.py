@@ -1154,6 +1154,9 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     (demo_root / "generation_quality_log.json").write_text(
         json.dumps(generation_quality_log, indent=2), encoding="utf-8"
     )
+    
+    # Create isolation directory before writing any files into it.
+    (demo_root / "isolation").mkdir(parents=True, exist_ok=True)
 
     stale_root = demo_root / "isolation" / "stale_generated_tests"
     stale_moved = isolate_stale_generated_tests(project_root, generated_paths, stale_root)
