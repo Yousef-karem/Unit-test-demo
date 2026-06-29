@@ -90,6 +90,7 @@ from demo.utils import (
     repair_runtime_semantic_mismatches,
     repo_name_from_arg,
     rewrite_interface_mocks_to_concrete,
+    safe_name,
     sanitize_java_output,
     validate_java_test_output,
     validate_junit_framework,
@@ -379,28 +380,127 @@ def concise_error_log(log: str, max_lines: int = 80) -> str:
     return "\n".join(selected[-max_lines:])
 
 
-def concise_compile_error_log(log: str, failing_path: Path, max_lines: int = 30) -> str:
-    """Extract compile errors scoped to a specific test file for shorter repair prompts."""
+def _compile_error_kind(block: str) -> str:
+    lowered = block.lower()
+    if "cannot find symbol" in lowered:
+        return "cannot find symbol"
+    if "incompatible types" in lowered:
+        return "incompatible types"
+    if "has private access" in lowered:
+        return "private access"
+    if "inaccessible class or interface" in lowered:
+        return "inaccessible nested type/member"
+    if "cannot be applied to given types" in lowered:
+        return "wrong constructor/method arguments"
+    if "does not exist" in lowered:
+        return "missing package/import"
+    if "unreported exception" in lowered:
+        return "unreported checked exception"
+    if "cannot infer type" in lowered:
+        return "generic type inference"
+    first = block.splitlines()[0] if block.splitlines() else "compile error"
+    return re.sub(r"^.*?:\[\d+,\d+\]\s*", "", first).strip()[:80] or "compile error"
+
+
+def _append_compile_source_lines(errors: str, file_content: str) -> str:
+    file_lines = (file_content or "").splitlines()
+    seen: set[int] = set()
+    snippets: List[str] = []
+    for line_no in re.findall(r"\[(\d+),\d+\]", errors or ""):
+        ln = int(line_no)
+        if ln in seen or not (0 < ln <= len(file_lines)):
+            continue
+        seen.add(ln)
+        snippets.append(f"line {ln}: {file_lines[ln - 1].strip()}")
+    if not snippets:
+        return errors
+    return errors.rstrip() + "\n\nExact failing source lines:\n" + "\n".join(snippets)
+
+
+def concise_compile_error_log(log: str, failing_path: Path, max_lines: int = 120) -> str:
+    """Extract exact javac error blocks for one generated test file."""
     log = strip_ansi(log)
     needle = failing_path.name
-    scoped = [line for line in log.splitlines() if needle in line or "[ERROR]" in line]
-    if not scoped:
-        scoped = [
-            line
-            for line in log.splitlines()
-            if "[ERROR]" in line or "cannot find symbol" in line or "error:" in line.lower()
+    blocks: List[List[str]] = []
+    current: List[str] = []
+    new_error_re = re.compile(r"\.java:\[\d+,\d+\]")
+
+    def flush_current() -> None:
+        nonlocal current
+        if current:
+            blocks.append(current)
+            current = []
+
+    for line in log.splitlines():
+        is_this_file_error = needle in line and bool(new_error_re.search(line))
+        is_any_file_error = bool(new_error_re.search(line))
+        if is_this_file_error:
+            flush_current()
+            current = [line]
+            continue
+        if not current:
+            continue
+        if is_any_file_error or "Failed to execute goal" in line or "-> [Help" in line:
+            flush_current()
+            continue
+        if line.startswith("[ERROR]") or line.startswith("  "):
+            current.append(line)
+    flush_current()
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for block in blocks:
+        text = "\n".join(block).strip()
+        normalized = "\n".join(
+            re.sub(r"^\[ERROR\]\s*", "", line).strip()
+            for line in text.splitlines()
+        )
+        if text and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(text)
+
+    if deduped:
+        kinds = sorted({_compile_error_kind(block) for block in deduped})
+        lines = [
+            f"Exact compiler errors for {needle}:",
+            "Error types: " + ", ".join(kinds),
+            "",
         ]
-    selected = scoped or log.splitlines()
+        for index, block in enumerate(deduped, 1):
+            lines.append(f"--- error {index} ({_compile_error_kind(block)}) ---")
+            lines.extend(block.splitlines())
+        return "\n".join(lines[:max_lines])
+
+    scoped = [line for line in log.splitlines() if needle in line]
+    selected = scoped or [
+        line
+        for line in log.splitlines()
+        if "[ERROR]" in line or "cannot find symbol" in line or "error:" in line.lower()
+    ]
     return "\n".join(selected[-max_lines:])
+
+
+def repair_attempt_dir(demo_root: Path, stage: str, test_class: str, attempt: int) -> Path:
+    return (
+        demo_root
+        / "repair_iterations"
+        / stage
+        / safe_name(test_class)
+        / f"attempt_{attempt:02d}"
+    )
+
+
+def write_repair_artifact(attempt_dir: Path, name: str, text: str) -> None:
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    (attempt_dir / name).write_text(text or "", encoding="utf-8")
 
 
 def concise_runtime_error_log(
     log_or_trace: str,
     class_name: str = "",
     method_name: str = "",
-    max_lines: int = 30,
+    max_lines: int = 60,
 ) -> str:
-    """Extract Surefire failure details for a specific test method."""
     log = strip_ansi(log_or_trace)
     lines = log.splitlines()
     if not class_name and not method_name:
@@ -409,30 +509,36 @@ def concise_runtime_error_log(
     simple_class = class_name.rsplit(".", 1)[-1] if class_name else ""
     selected: List[str] = []
     capture = False
+
     for line in lines:
-        if method_name and (
-            f"{simple_class}.{method_name}" in line
-            or (">>> FAILURE!" in line and method_name in line)
-        ):
-            capture = True
-        elif simple_class and simple_class in line and (
-            "FAILURE" in line or "ERROR" in line or "Exception" in line
-        ):
+        triggers = [
+            method_name and method_name in line,
+            "AssertionError" in line,
+            "AssertionFailedError" in line,
+            "expected:" in line,
+            "Expected:" in line,
+            "but was:" in line,
+            "FAILURE" in line,
+            "Exception" in line,
+            "Caused by:" in line,
+            simple_class and simple_class in line and ("ERROR" in line or "FAILED" in line),
+        ]
+        if any(triggers):
             capture = True
         if capture:
             selected.append(line)
-            if len(selected) >= max_lines:
-                break
-    if not selected:
-        selected = [
-            line
-            for line in lines
-            if "AssertionError" in line
-            or "Exception" in line
-            or "Failed tests:" in line
-            or "FAILURE" in line
-        ]
-    return "\n".join((selected or lines)[-max_lines:])
+        if (
+            capture
+            and line.strip().startswith("at ")
+            and simple_class
+            and simple_class not in line
+            and len(selected) > 8
+        ):
+            capture = False
+        if len(selected) >= max_lines:
+            break
+
+    return "\n".join(selected or lines[-max_lines:])
 
 
 def count_passed_generated_tests(reports_dir: Path) -> int:
@@ -1214,6 +1320,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
 
     # --- Phase A: focused compile refinement ---
     print("Running Maven with RAT, Checkstyle, and Enforcer skipped for coverage-only execution.")
+    compile_repair_history: Dict[str, List[str]] = {}
     compile_loop_limit = max(1, len(generated_paths) * (max_refinement_iterations + 1))
     compile_attempt = 0
     for compile_iter in range(compile_loop_limit):
@@ -1255,7 +1362,6 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         if focused_compile_rc != 0:
             last_compile_log = focused_compile_log
 
-        compile_errors_for_repair = concise_compile_error_log(last_compile_log, failing_path)
         write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_before")
 
         fp = str(failing_path)
@@ -1266,6 +1372,11 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
         except FileNotFoundError:
             generated_paths = [p for p in generated_paths if Path(p).exists()]
             continue
+
+        compile_errors_for_repair = _append_compile_source_lines(
+            concise_compile_error_log(last_compile_log, failing_path),
+            file_content,
+        )
 
         test_class = failing_path.stem
         target = test_target_map.get(test_class, {})
@@ -1332,6 +1443,13 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
             f"Repairing {test_class} via LLM (attempt {retries + 1}/{max_refinement_iterations}) ...",
             flush=True,
         )
+        attempt_dir = repair_attempt_dir(demo_root, "compile", test_class, retries + 1)
+        prev_compile_attempts = compile_repair_history.get(fp, [])
+        write_repair_artifact(attempt_dir, "errors_before.txt", compile_errors_for_repair)
+        write_repair_artifact(attempt_dir, "code_before.java", file_content)
+        write_repair_artifact(attempt_dir, "previous_attempts.txt", "\n\n---\n\n".join(prev_compile_attempts))
+        write_repair_artifact(attempt_dir, "source_under_test.java", source_text)
+        write_repair_artifact(attempt_dir, "related_type_sources.txt", related_sources)
         try:
             fixed_code = ollama_repair_test(
                 model=args.gpt_model,
@@ -1344,8 +1462,11 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 related_type_sources=related_sources,
                 java_version=project_java_version,
                 junit_version=junit_version,
+                previous_attempts=prev_compile_attempts,
+                debug_dir=attempt_dir,
             )
         except OllamaRepairTimeout as exc:
+            write_repair_artifact(attempt_dir, "timeout.txt", str(exc))
             retry_counts[fp] = retries + 1
             compile_repair_attempts += 1
             repair_log.append(
@@ -1353,6 +1474,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                     "file": fp,
                     "action": "repair_timeout",
                     "errors_tail": str(exc),
+                    "attempt_dir": str(attempt_dir),
                 }
             )
             continue
@@ -1372,6 +1494,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
 
         invalid_fix_reason = validate_java_test_output(fixed_code, test_class)
         if not fixed_code.strip() or invalid_fix_reason:
+            write_repair_artifact(attempt_dir, "invalid_fix_reason.txt", invalid_fix_reason or "empty output")
             write_failure_artifacts(failing_path, last_compile_log, demo_root / "failures", "compile_final")
             retry_counts[fp] = retries + 1
             compile_repair_attempts += 1
@@ -1381,18 +1504,52 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                     "invalid_fix_reason": invalid_fix_reason,
                     "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
                     "action": "invalid_or_empty_fix",
+                    "attempt_dir": str(attempt_dir),
                 }
             )
             continue
 
         failing_path.write_text(fixed_code, encoding="utf-8")
+        write_repair_artifact(attempt_dir, "code_after.java", fixed_code)
+
+        with isolate_generated_tests_except(
+            project_root,
+            failing_path,
+            demo_root / "isolation" / "inner_compile_check",
+        ):
+            _inner_log, _inner_rc = run_maven_test_compile(
+                project_root, test_filter=failing_path.stem
+            )
+
+        _inner_errors = _append_compile_source_lines(
+            concise_compile_error_log(_inner_log, failing_path),
+            fixed_code,
+        )
+        write_repair_artifact(attempt_dir, "inner_compile_log.txt", _inner_log)
+        write_repair_artifact(attempt_dir, "inner_compile_errors.txt", _inner_errors)
+        write_repair_artifact(attempt_dir, "inner_compile_rc.txt", str(_inner_rc))
+        compile_repair_history.setdefault(fp, []).append(
+            f"=== Attempt {retries + 1} failed with these errors ===\n{compile_errors_for_repair}\n\n"
+            f"=== Code before repair ===\n{file_content}\n\n"
+            f"=== LLM repair code that was tried ===\n{fixed_code}"
+        )
+        if _inner_rc != 0:
+            _new_errors = _inner_errors
+            compile_errors_for_repair = _new_errors
+            compile_repair_history.setdefault(fp, []).append(
+                f"=== LLM fix still broken, new errors ===\n{_new_errors}\n\n"
+                f"=== Code after fix attempt ===\n{fixed_code}"
+            )
+
         retry_counts[fp] = retries + 1
         compile_repair_attempts += 1
         repair_log.append(
             {
                 "file": fp,
                 "errors_tail": concise_compile_error_log(last_compile_log, failing_path),
-                "action": "fixed",
+                "action": "fixed" if _inner_rc == 0 else "fix_still_broken",
+                "inner_compile_rc": _inner_rc,
+                "attempt_dir": str(attempt_dir),
             }
         )
 
@@ -1505,6 +1662,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 }
             )
 
+        repair_history: Dict[str, List[str]] = {}
         runtime_loop_limit = max(1, len(generated_paths) * (max_refinement_iterations + 1))
         runtime_attempt = 0
 
@@ -1554,18 +1712,14 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                     focused_test_log, focused_test_rc = run_maven_tests(
                         project_root, test_filter=test_filter
                     )
-                if focused_test_rc != 0:
-                    stack_trace = stack_trace or concise_runtime_error_log(
-                        focused_test_log,
-                        class_name=class_name,
-                        method_name=method_name,
-                    )
-                else:
-                    stack_trace = concise_runtime_error_log(
-                        stack_trace or focused_test_log,
-                        class_name=class_name,
-                        method_name=method_name,
-                    )
+
+                fresh_trace = concise_runtime_error_log(
+                    focused_test_log,
+                    class_name=class_name,
+                    method_name=method_name,
+                    max_lines=60,
+                )
+                stack_trace = fresh_trace if fresh_trace.strip() else stack_trace
 
                 write_failure_artifacts(failing_path, stack_trace, demo_root / "failures", "runtime_before")
 
@@ -1663,6 +1817,19 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                     f"(attempt {retries + 1}/{max_refinement_iterations}) ...",
                     flush=True,
                 )
+                runtime_attempt_dir = repair_attempt_dir(
+                    demo_root,
+                    "runtime",
+                    f"{test_class}_{method_name or 'all'}",
+                    retries + 1,
+                )
+                prev_attempts = repair_history.get(fp, [])
+                write_repair_artifact(runtime_attempt_dir, "stack_trace_before.txt", stack_trace)
+                write_repair_artifact(runtime_attempt_dir, "failing_method.txt", method_name or "")
+                write_repair_artifact(runtime_attempt_dir, "code_before.java", file_content)
+                write_repair_artifact(runtime_attempt_dir, "previous_attempts.txt", "\n\n---\n\n".join(prev_attempts))
+                write_repair_artifact(runtime_attempt_dir, "source_under_test.java", runtime_source_text)
+                write_repair_artifact(runtime_attempt_dir, "related_type_sources.txt", runtime_related_sources)
                 try:
                     fixed_code = ollama_runtime_repair_test(
                         model=args.gpt_model,
@@ -1673,8 +1840,11 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                         related_type_sources=runtime_related_sources,
                         java_version=project_java_version,
                         junit_version=junit_version,
+                        previous_attempts=prev_attempts,
+                        debug_dir=runtime_attempt_dir,
                     )
                 except OllamaRepairTimeout as exc:
+                    write_repair_artifact(runtime_attempt_dir, "timeout.txt", str(exc))
                     runtime_retries[retry_key] = retries + 1
                     runtime_repair_attempts += 1
                     runtime_repair_log.append(
@@ -1683,6 +1853,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                             "method": method_name or None,
                             "action": "repair_timeout",
                             "errors_tail": str(exc),
+                            "attempt_dir": str(runtime_attempt_dir),
                         }
                     )
                     changed_any = True
@@ -1703,6 +1874,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                             "method": method_name or None,
                             "action": "rejected_empty_fix",
                             "errors_tail": stack_trace,
+                            "attempt_dir": str(runtime_attempt_dir),
                         }
                     )
                     runtime_rejected_details.append(
@@ -1730,6 +1902,12 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                 )
 
                 failing_path.write_text(fixed_code, encoding="utf-8")
+                write_repair_artifact(runtime_attempt_dir, "code_after.java", fixed_code)
+                repair_history.setdefault(fp, []).append(
+                    f"=== Attempt {retries + 1} failed with this trace ===\n{stack_trace}\n\n"
+                    f"=== Code before repair ===\n{file_content}\n\n"
+                    f"=== LLM repair code that was tried ===\n{fixed_code}"
+                )
                 runtime_retries[retry_key] = retries + 1
                 runtime_repair_attempts += 1
                 runtime_repair_log.append(
@@ -1738,6 +1916,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
                         "method": method_name or None,
                         "action": "fixed",
                         "errors_tail": stack_trace,
+                        "attempt_dir": str(runtime_attempt_dir),
                     }
                 )
                 changed_any = True

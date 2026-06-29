@@ -11,6 +11,75 @@ def run(cmd: List[str], cwd: Optional[Path] = None, check: bool = True) -> subpr
     return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=check, text=True, capture_output=True)
 
 
+def strip_ansi(s: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", s or "")
+
+
+def concise_error_log(log: str, max_lines: int = 80) -> str:
+    lines = strip_ansi(log).splitlines()
+    important = [
+        line
+        for line in lines
+        if (
+            "[ERROR]" in line
+            or "Failed tests:" in line
+            or "Errors:" in line
+            or "Failures:" in line
+            or "Exception" in line
+            or "Caused by:" in line
+            or "cannot find symbol" in line
+        )
+    ]
+    selected = important or lines
+    return "\n".join(selected[-max_lines:])
+
+
+def concise_runtime_error_log(
+    log_or_trace: str,
+    class_name: str = "",
+    method_name: str = "",
+    max_lines: int = 60,
+) -> str:
+    log = strip_ansi(log_or_trace)
+    lines = log.splitlines()
+    if not class_name and not method_name:
+        return concise_error_log(log, max_lines=max_lines)
+
+    simple_class = class_name.rsplit(".", 1)[-1] if class_name else ""
+    selected: List[str] = []
+    capture = False
+
+    for line in lines:
+        triggers = [
+            method_name and method_name in line,
+            "AssertionError" in line,
+            "AssertionFailedError" in line,
+            "expected:" in line,
+            "Expected:" in line,
+            "but was:" in line,
+            "FAILURE" in line,
+            "Exception" in line,
+            "Caused by:" in line,
+            simple_class and simple_class in line and ("ERROR" in line or "FAILED" in line),
+        ]
+        if any(triggers):
+            capture = True
+        if capture:
+            selected.append(line)
+        if (
+            capture
+            and line.strip().startswith("at ")
+            and simple_class
+            and simple_class not in line
+            and len(selected) > 8
+        ):
+            capture = False
+        if len(selected) >= max_lines:
+            break
+
+    return "\n".join(selected or lines[-max_lines:])
+
+
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import requests
 from typing import Dict, Tuple
 
@@ -109,6 +110,25 @@ def ollama_generate_text(
         ) from exc
     _check_ollama_response(r, model)
     return (r.json().get("response") or "").strip()
+
+
+def _write_repair_debug(
+    debug_dir: str | Path | None,
+    system_prompt: str,
+    user_prompt: str,
+    raw_response: str | None = None,
+    sanitized_response: str | None = None,
+) -> None:
+    if not debug_dir:
+        return
+    path = Path(debug_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "system_prompt.txt").write_text(system_prompt, encoding="utf-8")
+    (path / "user_prompt.txt").write_text(user_prompt, encoding="utf-8")
+    if raw_response is not None:
+        (path / "raw_response.txt").write_text(raw_response, encoding="utf-8")
+    if sanitized_response is not None:
+        (path / "sanitized_response.java").write_text(sanitized_response, encoding="utf-8")
 
 
 def _junit_prompt_rules(junit_version: str, has_mockito: bool) -> Tuple[str, str, str, str, str, str]:
@@ -225,7 +245,10 @@ Constraints for the generated test class:
 - The Java code inside the "prompt" field MUST declare: public class <test_class_name> using the exact test_class_name value from this JSON.
 - Only call methods and access fields that appear in the source snippet, related type sources, or allowlist. Do not invent getters/setters (e.g. getKey()) unless they exist in the provided source.
 - Do NOT call private methods from tests; use only public or protected entry points visible in the snippet.
+- Do NOT read or write private fields from tests. If state is private, assert through public methods, return values, exceptions, or observable output only.
+- Do NOT instantiate or reference private/package-private nested implementation classes unless the source shows they are public and accessible from the test package.
 - For concrete classes, prefer constructing real instances (using constructors from the source) instead of mocking domain types.
+- Use exact constructor and method signatures from the source. If a constructor requires arguments, create the required real arguments; never call a no-arg constructor unless it exists.
 - When a method parameter is an interface and a concrete implementation exists in the allowlist (e.g. Item -> MyItem), pass real instances like `new MyItem(5)` — never mock interface methods with Mockito.
 - Access public fields directly when no getter exists (e.g. `item.key`, not `item.getKey()`).
 - Cover all branches: equal, less-than, and greater-than paths where the source has conditionals.
@@ -260,6 +283,8 @@ def ollama_repair_test(
     related_type_sources: str = "",
     java_version: str = "17",
     junit_version: str = "5",
+    previous_attempts: list[str] | None = None,
+    debug_dir: str | Path | None = None,
 ) -> str:
     junit_import_note = (
         "Keep or add org.junit.Test and static org.junit.Assert imports for every annotation/assertion used."
@@ -277,12 +302,23 @@ def ollama_repair_test(
     file_content = _clip_repair_context(file_content, 14000)
     source_text = _clip_repair_context(source_text, 16000)
     related_type_sources = _clip_repair_context(related_type_sources, 18000)
+    prev_section = ""
+    if previous_attempts:
+        trimmed = []
+        for entry in previous_attempts[-2:]:
+            trimmed.append(_clip_repair_context(entry, 3000))
+        prev_section = (
+            "\n\nPREVIOUS REPAIR ATTEMPTS THAT STILL FAILED - do NOT repeat these approaches:\n"
+            + "\n---\n".join(trimmed)
+            + "\n"
+        )
     user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
 
 Compiler errors:
 {compiler_errors}
+{prev_section}
 
 File content:
 {file_content}
@@ -308,6 +344,9 @@ Only call methods and access fields that exist in the related type sources or cl
 If compiler errors say a field is missing on an interface/base type but related sources show one concrete implementation with that public field, cast before reading it (for example `((MeuItem) result).chave`).
 If compiler errors say an invented getter method is missing but the source shows a public field with the same property name, read the field directly.
 If compiler errors say a class symbol is missing, either add the correct import from the related sources/package lines or remove that test idea; do not invent a class.
+If compiler errors say a field has private access, remove that field access and assert through public behavior only.
+If compiler errors say a nested type/member is inaccessible, do not reference it directly; use public APIs that expose equivalent behavior.
+If compiler errors say a constructor or method cannot be applied to given types, change the call to exactly match one signature shown in the source/context.
 Fix the existing test minimally. Preserve tests that already compile and keep every assertion tied to real production behavior.
 Start directly with package/import/class declarations. Do not include markdown fences, headings, bullet lists, or explanations.
 {junit_import_note}
@@ -315,9 +354,11 @@ Do not mock the class or method under test. Each test must call real production 
 Do not invent dependency types. If a referenced type (e.g., UserRepository) does not exist in the project, replace it with the closest matching real type from the repository list or remove that dependency and adjust the test accordingly.
 """.strip()
 
-    return sanitize_java_output(
-        ollama_generate_text(model, user, sys, timeout=OLLAMA_REPAIR_TIMEOUT)
-    )
+    _write_repair_debug(debug_dir, sys, user)
+    raw_response = ollama_generate_text(model, user, sys, timeout=OLLAMA_REPAIR_TIMEOUT)
+    sanitized = sanitize_java_output(raw_response)
+    _write_repair_debug(debug_dir, sys, user, raw_response, sanitized)
+    return sanitized
 
 
 def _assertion_error_repair_guidance(stack_trace: str, source_text: str) -> str:
@@ -354,6 +395,8 @@ def ollama_runtime_repair_test(
     related_type_sources: str = "",
     java_version: str = "17",
     junit_version: str = "5",
+    previous_attempts: list[str] | None = None,
+    debug_dir: str | Path | None = None,
 ) -> str:
     sys = (
         "You are a senior Java testing expert. "
@@ -364,6 +407,25 @@ def ollama_runtime_repair_test(
     file_content = _clip_repair_context(file_content, 14000)
     source_text = _clip_repair_context(source_text, 16000)
     related_type_sources = _clip_repair_context(related_type_sources, 18000)
+    prev_section = ""
+    if previous_attempts:
+        trimmed = []
+        for entry in previous_attempts[-2:]:
+            trimmed.append(_clip_repair_context(entry, 3000))
+        prev_section = (
+            "\n\nPREVIOUS REPAIR ATTEMPTS THAT STILL FAILED - do NOT repeat these approaches:\n"
+            + "\n---\n".join(trimmed)
+            + "\n"
+        )
+
+    method_focus = ""
+    if failing_method:
+        method_focus = (
+            f"\nCRITICAL: The ONLY failing method is `{failing_method}`. "
+            f"Find it in the file, read its assertions carefully, compare them against "
+            f"the source under test, and fix ONLY what is logically wrong. "
+            f"Do not touch passing test methods.\n"
+        )
     user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
@@ -373,6 +435,8 @@ Failing test method:
 
 Stack trace:
 {stack_trace}
+{method_focus}
+{prev_section}
 
 {assertion_guidance}
 
@@ -393,6 +457,8 @@ If a string-search algorithm crashes on an empty pattern (m == 0 / P == ""), cha
 If a test captures System.out, save `PrintStream originalOut = System.out` before replacing it and restore with `System.setOut(originalOut)`.
 """.strip()
 
-    return sanitize_java_output(
-        ollama_generate_text(model, user, sys, timeout=OLLAMA_REPAIR_TIMEOUT)
-    )
+    _write_repair_debug(debug_dir, sys, user)
+    raw_response = ollama_generate_text(model, user, sys, timeout=OLLAMA_REPAIR_TIMEOUT)
+    sanitized = sanitize_java_output(raw_response)
+    _write_repair_debug(debug_dir, sys, user, raw_response, sanitized)
+    return sanitized
