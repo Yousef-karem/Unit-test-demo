@@ -659,79 +659,68 @@ def class_ast_summary(fqcn: str, class_info: Dict) -> str:
         f"class: {fqcn}",
         f"kind: {class_info.get('kind', 'class')}",
     ]
-    if class_info.get("domainKind"):
-        lines.append(f"domainKind: {class_info['domainKind']}")
-    if class_info.get("annotations"):
-        lines.append(f"annotations: {', '.join(class_info['annotations'])}")
-    if class_info.get("extendsClass"):
-        lines.append(f"extends: {class_info['extendsClass']}")
-    if class_info.get("implementsList"):
-        lines.append(f"implements: {', '.join(class_info['implementsList'])}")
 
-    # ------------------------------------------------------------------
-    # Class-level Javadoc
-    # ------------------------------------------------------------------
     class_jdoc = extract_class_javadoc(class_info)
     if class_jdoc:
         lines.append("javadoc:")
         _render_javadoc_info(lines, class_jdoc)
-    #============================ end ================================= 
-    
-    
-    
+    else:
+        if class_info.get("domainKind"):
+            lines.append(f"domainKind: {class_info['domainKind']}")
+        if class_info.get("annotations"):
+            lines.append(f"annotations: {', '.join(class_info['annotations'])}")
+        if class_info.get("extendsClass"):
+            lines.append(f"extends: {class_info['extendsClass']}")
+        if class_info.get("implementsList"):
+            lines.append(f"implements: {', '.join(class_info['implementsList'])}")
+
     if class_info.get("autowiredComponents"):
         lines.append("autowiredComponents:")
         lines.extend(f"- {item}" for item in class_info["autowiredComponents"][:20])
-    
-    # ------------------------------------------------------------------
-    # Fields (structural + optional Javadoc)
-    # ------------------------------------------------------------------
+
     fields = class_info.get("fields") or []
     if fields:
         lines.append("fields:")
         for fld in fields[:30]:
-            mods = " ".join(fld.get("modifiers") or [])
-            field_type = fld.get("resolvedType") or fld.get("type") or "Object"
-            anns = fld.get("annotations") or []
-            ann_text = f" @{','.join(anns)}" if anns else ""
-            lines.append(f"- {mods} {field_type} {fld.get('name', '')}{ann_text}".strip())
             field_jdoc = extract_field_javadoc(fld)
             if field_jdoc:
+                field_type = fld.get("resolvedType") or fld.get("type") or "Object"
+                lines.append(f"- {fld.get('name', '')} ({field_type})")
                 if field_jdoc.summary:
                     lines.append(f"  doc: {field_jdoc.summary}")
                 if field_jdoc.description:
                     lines.append(f"  description: {field_jdoc.description}")
                 if field_jdoc.deprecated:
                     lines.append(f"  @deprecated: {field_jdoc.deprecated}")
-    
-    
-    # ------------------------------------------------------------------
-    # Constructors (structural + optional Javadoc)
-    # ------------------------------------------------------------------
+            else:
+                mods = " ".join(fld.get("modifiers") or [])
+                field_type = fld.get("resolvedType") or fld.get("type") or "Object"
+                anns = fld.get("annotations") or []
+                ann_text = f" @{','.join(anns)}" if anns else ""
+                lines.append(f"- {mods} {field_type} {fld.get('name', '')}{ann_text}".strip())
+
     constructors = class_info.get("constructors") or []
     if constructors:
         lines.append("constructors:")
         for ctor in constructors[:12]:
             lines.append(f"- {ctor.get('signature', 'constructor')}")
-            snippet = (ctor.get("sourceSnippet") or "").strip()
-            if snippet:
-                lines.append(f"  snippet: {snippet[:240]}")
-                #==========added==============
-                ctor_jdoc = extract_constructor_javadoc(ctor)
+            ctor_jdoc = extract_constructor_javadoc(ctor)
             if ctor_jdoc:
                 _render_method_javadoc(lines, ctor_jdoc, indent="  ")
-    
-    
-    # ------------------------------------------------------------------
-    # Methods (structural signature + full Javadoc per method)
-    # ------------------------------------------------------------------
+            else:
+                snippet = (ctor.get("sourceSnippet") or "").strip()
+                if snippet:
+                    lines.append(f"  snippet: {snippet[:240]}")
+
     lines.append("methods:")
     for sig, method in (class_info.get("methods") or {}).items():
-        lines.append(f"- {method.get('returnType', 'void')} {sig}")
-        #==========added==============
         method_jdoc = extract_method_javadoc(method)
         if method_jdoc:
+            lines.append(f"- {sig}")
             _render_method_javadoc(lines, method_jdoc, indent="  ")
+        else:
+            lines.append(f"- {method.get('returnType', 'void')} {sig}")
+
     return "\n".join(lines)
 
 
