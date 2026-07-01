@@ -10,7 +10,7 @@ on:
 
 jobs:
   generate-tests:
-    runs-on: self-hosted
+    runs-on: windows-latest
 
     defaults:
       run:
