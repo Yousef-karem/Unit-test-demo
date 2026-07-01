@@ -17,7 +17,15 @@ from demo.coverage.maven import (
 )
 from demo.coverage.parse import parse_jacoco_xml, parse_surefire_reports, parse_surefire_summary
 from demo.coverage.runner import configure_maven_runner, docker_image_name, ensure_docker_available
-from demo.pipeline import isolate_non_generated_test_files, restore_isolated_test_files, write_test_file
+from demo.pipeline import (
+    add_throws_exception_to_test_methods,
+    isolate_non_generated_test_files,
+    prune_generated_snapshots,
+    restore_isolated_test_files,
+    sync_generated_snapshot,
+    sync_generated_snapshots,
+    write_test_file,
+)
 
 
 def _resolve_path(path_str: str, base: Path) -> Path:
@@ -66,41 +74,75 @@ def _package_from_generated_file(path: Path) -> str:
     return m.group(1) if m else ""
 
 
+def _refresh_generated_snapshots_from_repo(demo_root: Path) -> None:
+    """Prefer repo survivor copies over stale DemoTestCases/generated/ snapshots."""
+    summary_path = demo_root / "summary.json"
+    if not summary_path.exists():
+        return
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    for path_str in summary.get("survivor_test_files_in_repo") or []:
+        path = _resolve_path(path_str, Path.cwd())
+        if path.exists():
+            sync_generated_snapshot(demo_root, path)
+
+
 def ensure_generated_tests(project_root: Path, demo_root: Path) -> List[str]:
-    written_paths: List[str] = []
-    written_paths_file = demo_root / "written_paths.json"
-    if written_paths_file.exists():
-        raw = json.loads(written_paths_file.read_text(encoding="utf-8"))
-        written_paths = [_resolve_path(p, Path.cwd()) for p in raw]
+    """Install only survivor snapshots from DemoTestCases/generated/ into the repo."""
+    _refresh_generated_snapshots_from_repo(demo_root)
 
     generated_paths: List[str] = []
-    seen = set()
-
-    for path in written_paths:
-        if path.exists():
-            generated_paths.append(str(path))
-            seen.add(path.resolve())
-
     generated_dir = demo_root / "generated"
+
+    allowed_stems: set[str] = set()
     if generated_dir.is_dir():
         for src in sorted(generated_dir.glob(f"{GENERATED_PREFIX}*Test.java")):
-            resolved = src.resolve()
-            if resolved in seen:
-                continue
+            allowed_stems.add(src.stem)
             test_class = src.stem
             pkg = _package_from_generated_file(src)
             code = src.read_text(encoding="utf-8", errors="ignore")
             dest = write_test_file(project_root, pkg, test_class, code)
             generated_paths.append(str(dest))
-            seen.add(dest.resolve())
 
-    for test_file in project_root.rglob(f"{GENERATED_PREFIX}*Test.java"):
-        resolved = test_file.resolve()
-        if resolved not in seen:
-            generated_paths.append(str(test_file))
-            seen.add(resolved)
+    for test_file in list(project_root.rglob(f"{GENERATED_PREFIX}*Test.java")):
+        if test_file.stem not in allowed_stems:
+            try:
+                test_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if not generated_paths:
+        summary_path = demo_root / "summary.json"
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            for path_str in summary.get("survivor_test_files_in_repo") or []:
+                path = _resolve_path(path_str, Path.cwd())
+                if path.exists():
+                    generated_paths.append(str(path))
 
     return list(dict.fromkeys(str(Path(p).resolve()) for p in generated_paths))
+
+
+def _apply_checked_exception_fixes(
+    project_root: Path,
+    demo_root: Path,
+    generated_paths: List[str],
+    compile_log: str,
+) -> bool:
+    if "unreported exception" not in compile_log:
+        return False
+    changed = False
+    for path_str in generated_paths:
+        test_path = Path(path_str)
+        if not test_path.exists():
+            continue
+        code = test_path.read_text(encoding="utf-8", errors="ignore")
+        fixed = add_throws_exception_to_test_methods(code, compile_log)
+        if fixed == code:
+            continue
+        test_path.write_text(fixed, encoding="utf-8")
+        sync_generated_snapshot(demo_root, test_path)
+        changed = True
+    return changed
 
 
 def configure_maven_from_run(demo_root: Path, args) -> None:
@@ -156,9 +198,16 @@ def run_coverage_from_run(args) -> None:
     generated_paths = ensure_generated_tests(project_root, demo_root)
     if not generated_paths:
         raise RuntimeError(
-            "No generated tests found in this run. "
-            f"Expected files under {demo_root / 'generated'} or in the cloned repo."
+            "No survivor generated tests found in this run. "
+            f"Expected files under {demo_root / 'generated'} (after compile/runtime filtering) "
+            "or survivor paths in summary.json."
         )
+
+    prune_generated_snapshots(demo_root, generated_paths)
+    sync_generated_snapshots(demo_root, generated_paths)
+    (demo_root / "written_paths.json").write_text(
+        json.dumps(generated_paths, indent=2), encoding="utf-8"
+    )
 
     print(f"Found {len(generated_paths)} generated test file(s).")
 
@@ -174,6 +223,10 @@ def run_coverage_from_run(args) -> None:
     compile_log_path = demo_root / "compile" / "compile_log.txt"
     compile_log_path.parent.mkdir(parents=True, exist_ok=True)
     compile_log, compile_rc = run_maven_test_compile(project_root)
+    if compile_rc != 0 and _apply_checked_exception_fixes(
+        project_root, demo_root, generated_paths, compile_log
+    ):
+        compile_log, compile_rc = run_maven_test_compile(project_root)
     with compile_log_path.open("w", encoding="utf-8") as f:
         f.write(compile_log)
 

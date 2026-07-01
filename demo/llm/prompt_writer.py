@@ -4,7 +4,11 @@ import json
 import requests
 from typing import Dict, Tuple
 
-from demo.config import OLLAMA_URL, GENERATED_PREFIX, DEFAULT_OLLAMA_REPAIR_TIMEOUT
+from demo.config import (
+    DEFAULT_OLLAMA_REPAIR_TIMEOUT,
+    GENERATED_PREFIX,
+    OLLAMA_URL,
+)
 from demo.coverage.java_version import java_version_guidance
 from demo.targets import extract_imports_context
 from demo.utils import sanitize_java_output
@@ -13,6 +17,12 @@ from demo.utils import sanitize_java_output
 # so a generous timeout is needed for smaller local models.
 OLLAMA_TIMEOUT = 600
 OLLAMA_REPAIR_TIMEOUT = DEFAULT_OLLAMA_REPAIR_TIMEOUT
+
+
+def set_ollama_repair_timeout(seconds: int) -> None:
+    """Override repair timeout for the current process (used by pipeline CLI)."""
+    global OLLAMA_REPAIR_TIMEOUT
+    OLLAMA_REPAIR_TIMEOUT = max(30, int(seconds))
 
 
 class OllamaRepairTimeout(RuntimeError):
@@ -236,6 +246,69 @@ Allowlist (project types):
     return ollama_generate_json(model, user, sys)
 
 
+def ollama_write_compile_repair_prompt(
+    model: str,
+    compiler_errors: str,
+    file_content: str,
+    source_text: str = "",
+    package_imports: str = "",
+    constructor_info: str = "",
+    repository_types: str = "",
+    related_type_sources: str = "",
+    semantic_hints: str = "",
+    error_summary: str = "",
+    java_version: str = "17",
+    junit_version: str = "5",
+) -> Dict:
+    sys = (
+        "You are a senior Java testing expert. "
+        f"You write precise repair prompts for fixing compilation errors in JUnit {junit_version} tests."
+    )
+    user = f"""
+Return ONLY valid JSON with key:
+- "repair_prompt": string (detailed instructions for a code-generation model to fix the test)
+
+Target Java version: {java_version}. {java_version_guidance(java_version)}
+Target test framework: JUnit {junit_version}.
+
+Compiler errors:
+{compiler_errors}
+
+Structured error summary (use this as the primary diagnosis):
+{error_summary or "(not provided)"}
+
+Current test file:
+{file_content}
+
+Class under test source:
+{source_text or "(not provided)"}
+
+Package/import lines:
+{package_imports or "(not provided)"}
+
+Constructor signature info:
+{constructor_info or "(not provided)"}
+
+Repository-like types in project:
+{repository_types or "(not provided)"}
+
+Related type sources (only use APIs shown here):
+{related_type_sources or "(not provided)"}
+
+{semantic_hints}
+
+Write a repair_prompt that:
+- Uses the structured error summary as the primary diagnosis (do not guess missing imports when the issue is wrong constructor or typo)
+- Identifies each compile error root cause (missing import, wrong constructor, unreported exception, invented API, typo)
+- Gives concrete fix steps using ONLY APIs from the source and related type sources
+- Instructs to keep class name, package, and all working @Test methods unchanged
+- Instructs to return ONLY the complete corrected Java test file with no markdown
+- Does not introduce new libraries beyond JUnit and Mockito (if already used)
+""".strip()
+
+    return ollama_generate_json(model, user, sys)
+
+
 def ollama_repair_test(
     model: str,
     compiler_errors: str,
@@ -247,6 +320,7 @@ def ollama_repair_test(
     related_type_sources: str = "",
     java_version: str = "17",
     junit_version: str = "5",
+    repair_prompt: str | None = None,
 ) -> str:
     junit_import_note = (
         "Keep or add org.junit.Test and static org.junit.Assert imports for every annotation/assertion used."
@@ -260,7 +334,16 @@ def ollama_repair_test(
         "You are a senior Java testing expert. "
         f"You fix compilation errors in JUnit {junit_version} tests."
     )
-    user = f"""
+    if repair_prompt:
+        user = (
+            f"Target Java version: {java_version}. {java_version_guidance(java_version)}\n"
+            f"Target test framework: JUnit {junit_version}.\n\n"
+            f"{repair_prompt}\n\n"
+            f"Current test file:\n{file_content}\n\n"
+            "Return ONLY the complete corrected Java test file. No markdown, no explanations."
+        )
+    else:
+        user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
 
@@ -285,7 +368,7 @@ Repository-like types in project:
 Related type sources (only use APIs shown here):
 {related_type_sources or "(none)"}
 
-Instruction: Return corrected Java test file ONLY, keep class name and package, fix typing/import issues, don’t introduce new libraries.
+Instruction: Return corrected Java test file ONLY, keep class name and package, fix typing/import issues, don't introduce new libraries.
 If compiler errors say org.mockito does not exist, remove every Mockito import/annotation/call and {plain_junit_note}.
 Only call methods and access fields that exist in the related type sources or class under test source. Replace invented methods (e.g. getKey()) with real constructors/fields/APIs from the source.
 Start directly with package/import/class declarations. Do not include markdown fences, headings, bullet lists, or explanations.
@@ -297,7 +380,6 @@ Do not invent dependency types. If a referenced type (e.g., UserRepository) does
     return sanitize_java_output(
         ollama_generate_text(model, user, sys, timeout=OLLAMA_REPAIR_TIMEOUT)
     )
-
 
 def _assertion_error_repair_guidance(stack_trace: str, source_text: str) -> str:
     if "AssertionError" not in stack_trace:
@@ -324,6 +406,61 @@ def _assertion_error_repair_guidance(stack_trace: str, source_text: str) -> str:
     return "\n".join(lines)
 
 
+def ollama_write_runtime_repair_prompt(
+    model: str,
+    stack_trace: str,
+    file_content: str,
+    failing_methods: str = "",
+    source_text: str = "",
+    related_type_sources: str = "",
+    semantic_hints: str = "",
+    java_version: str = "17",
+    junit_version: str = "5",
+) -> Dict:
+    sys = (
+        "You are a senior Java testing expert. "
+        f"You write precise repair prompts for fixing runtime failures in JUnit {junit_version} tests."
+    )
+    assertion_guidance = _assertion_error_repair_guidance(stack_trace, source_text)
+    user = f"""
+Return ONLY valid JSON with key:
+- "repair_prompt": string (detailed instructions for a code-generation model to fix the test)
+
+Target Java version: {java_version}. {java_version_guidance(java_version)}
+Target test framework: JUnit {junit_version}.
+
+Failing test method(s):
+{failing_methods or "(not provided)"}
+
+Stack trace:
+{stack_trace}
+
+{assertion_guidance}
+
+Current test file:
+{file_content}
+
+Class under test source:
+{source_text or "(not provided)"}
+
+Related type sources / AST summaries:
+{related_type_sources or "(not provided)"}
+
+{semantic_hints}
+
+Write a repair_prompt that:
+- Identifies the root cause from the stack trace (NPE, AssertionError, missing mock, wrong constructor, etc.)
+- Gives concrete fix steps using ONLY APIs from the source and related type sources
+- Instructs to keep class name and package unchanged
+- Instructs to return ONLY the complete corrected Java test file with no markdown
+- Does not introduce new libraries beyond JUnit and Mockito (if already used)
+- Replaces null/mocked domain values with real concrete instances when NPE occurs
+- For interface parameters, uses concrete implementations from related sources
+""".strip()
+
+    return ollama_generate_json(model, user, sys)
+
+
 def ollama_runtime_repair_test(
     model: str,
     stack_trace: str,
@@ -333,13 +470,23 @@ def ollama_runtime_repair_test(
     related_type_sources: str = "",
     java_version: str = "17",
     junit_version: str = "5",
+    repair_prompt: str | None = None,
 ) -> str:
     sys = (
         "You are a senior Java testing expert. "
         f"You fix runtime errors in JUnit {junit_version} tests."
     )
-    assertion_guidance = _assertion_error_repair_guidance(stack_trace, source_text)
-    user = f"""
+    if repair_prompt:
+        user = (
+            f"Target Java version: {java_version}. {java_version_guidance(java_version)}\n"
+            f"Target test framework: JUnit {junit_version}.\n\n"
+            f"{repair_prompt}\n\n"
+            f"Current test file:\n{file_content}\n\n"
+            "Return ONLY the complete corrected Java test file. No markdown, no explanations."
+        )
+    else:
+        assertion_guidance = _assertion_error_repair_guidance(stack_trace, source_text)
+        user = f"""
 Target Java version: {java_version}. {java_version_guidance(java_version)}
 Target test framework: JUnit {junit_version}.
 
@@ -360,7 +507,7 @@ Class under test source:
 Related type sources / AST summaries:
 {related_type_sources or "(not provided)"}
 
-Instruction: Return corrected Java test file ONLY, keep class name and package, fix runtime errors, don’t introduce new libraries.
+Instruction: Return corrected Java test file ONLY, keep class name and package, fix runtime errors, don't introduce new libraries.
 If the stack trace shows a NullPointerException from an array element or interface value, replace null/mocked domain values with real concrete instances from related type sources.
 For interface parameters, use concrete implementations and constructors shown above. Do not mock domain/value interfaces when concrete implementations exist.
 """.strip()

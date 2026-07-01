@@ -8,9 +8,15 @@ from demo.config import (
     DEFAULT_GENERATION_THREADS,
     DEFAULT_GPT_MODEL,
     DEFAULT_PROMPT_MODE,
+    DEFAULT_MAX_COMPILE_REPAIR_ATTEMPTS,
     DEFAULT_MAX_ITERATION_REFINEMENTS,
+    DEFAULT_MAX_RUNTIME_REPAIR_ATTEMPTS,
     DEFAULT_MAX_STAGNATION_ITERATIONS,
     DEFAULT_OLLAMA_MODEL,
+    DEFAULT_COMPILE_REPAIR_THREADS,
+    DEFAULT_OLLAMA_REPAIR_CONCURRENCY,
+    DEFAULT_OLLAMA_REPAIR_TIMEOUT,
+    DEFAULT_RUNTIME_REPAIR_THREADS,
     DEFAULT_SKIP_GENERATION_COMPILE_GATE,
 )
 
@@ -119,13 +125,49 @@ def main() -> None:
         "--max-refinement-iterations",
         type=int,
         default=DEFAULT_MAX_ITERATION_REFINEMENTS,
-        help="Maximum LLM repair attempts per generated test during compile/runtime refinement (default: 5)",
+        help="Maximum coverage-refinement LLM iterations per survivor test (default: 5)",
     )
     ap.add_argument(
         "--max-stagnation-iterations",
         type=int,
         default=DEFAULT_MAX_STAGNATION_ITERATIONS,
         help="Maximum consecutive coverage-refinement iterations with no improvement (default: 3)",
+    )
+    ap.add_argument(
+        "--max-runtime-repair-attempts",
+        type=int,
+        default=DEFAULT_MAX_RUNTIME_REPAIR_ATTEMPTS,
+        help="Maximum LLM repair attempts per failing test file during runtime refinement (default: 1)",
+    )
+    ap.add_argument(
+        "--runtime-repair-threads",
+        type=int,
+        default=DEFAULT_RUNTIME_REPAIR_THREADS,
+        help="Worker threads for parallel runtime repair (default: RUNTIME_REPAIR_THREADS env or 3)",
+    )
+    ap.add_argument(
+        "--max-compile-repair-attempts",
+        type=int,
+        default=DEFAULT_MAX_COMPILE_REPAIR_ATTEMPTS,
+        help="Maximum LLM repair attempts per failing test file during compile refinement (default: 1)",
+    )
+    ap.add_argument(
+        "--compile-repair-threads",
+        type=int,
+        default=DEFAULT_COMPILE_REPAIR_THREADS,
+        help="Worker threads for parallel compile repair (default: COMPILE_REPAIR_THREADS env or 3)",
+    )
+    ap.add_argument(
+        "--ollama-repair-timeout",
+        type=int,
+        default=DEFAULT_OLLAMA_REPAIR_TIMEOUT,
+        help="Ollama timeout in seconds per compile/runtime repair call (default: OLLAMA_REPAIR_TIMEOUT env or 300)",
+    )
+    ap.add_argument(
+        "--ollama-repair-concurrency",
+        type=int,
+        default=DEFAULT_OLLAMA_REPAIR_CONCURRENCY,
+        help="Max concurrent Ollama repair calls (default: OLLAMA_REPAIR_CONCURRENCY env or 1; use 1 on single GPU)",
     )
     ap.add_argument(
         "--skip-generation-compile-gate",
