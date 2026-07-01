@@ -37,7 +37,7 @@ jobs:
       - name: Run Test Generator
         run: |
           python llm_coverage_demo.py `
-            --repo . `
+            --repo "D:\hagar\33Java-Project-Dataset\01Max" `
             --mode method `
             --analysis-mode ast `
             --max-targets 150
