@@ -40,7 +40,6 @@ jobs:
             --repo . `
             --mode method `
             --analysis-mode ast `
-            --class-prompt-slices 3 `
             --max-targets 150
 
       - name: Upload Results
