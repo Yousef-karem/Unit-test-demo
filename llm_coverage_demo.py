@@ -28,9 +28,10 @@ def main() -> None:
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
     ap.add_argument(
         "--prompt-mode",
-        choices=["llm", "static"],
+        choices=["llm", "class-slice-llm", "static"],
         default=DEFAULT_PROMPT_MODE,
-        help="Prompt generation strategy: llm (LLM meta-prompt) or static (AST semantic prompt builder)",
+        help="Prompt generation strategy: llm (LLM meta-prompt), class-slice-llm (multi-prompt class mode), "
+        "or static (AST semantic prompt builder)",
     )
     ap.add_argument("--build", choices=["auto", "maven", "gradle"], default="auto")
     ap.add_argument(
@@ -116,6 +117,13 @@ def main() -> None:
     ap.add_argument("--max-files", type=int, default=10, help="Safety limit for demo; increase if you want")
     ap.add_argument("--max-targets", type=int, default=50, help="Safety limit for demo; increase if you want")
     ap.add_argument(
+        "--class-prompt-slices",
+        type=int,
+        default=1,
+        choices=[1, 2, 3, 4],
+        help="In class mode with AST analysis, expand each class into N focused prompt slices (default: 1 = current behavior)",
+    )
+    ap.add_argument(
         "--max-refinement-iterations",
         type=int,
         default=DEFAULT_MAX_ITERATION_REFINEMENTS,
@@ -166,6 +174,10 @@ def main() -> None:
         ap.error("--repo is required unless --from-run is provided.")
     if args.prompt_mode == "static" and args.analysis_mode != "ast":
         ap.error("Static prompt mode requires --analysis-mode ast")
+    if args.class_prompt_slices > 1 and args.mode != "class":
+        ap.error("--class-prompt-slices requires --mode class")
+    if args.class_prompt_slices > 1 and args.analysis_mode != "ast":
+        ap.error("--class-prompt-slices requires --analysis-mode ast")
     from demo.prompt_generation.factory import create_prompt_generator
     from demo.pipeline import Pipeline
 
