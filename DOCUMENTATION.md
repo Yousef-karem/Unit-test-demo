@@ -313,10 +313,14 @@ Central constants used across the project.
 | `DEFAULT_GPT_MODEL` | env `GPT_MODEL` or `qwen2.5-coder:7b` | Default prompt/repair model |
 | `GENERATED_PREFIX` | `"LLM_Generated"` | Prefix for all generated test class names |
 | `GENERATED_PATTERN` | `"LLM_Generated*Test"` | Maven `-Dtest=` filter pattern |
-| `DEMO_OUT` | `Path("demo_out")` | Root folder for all run artifacts |
+| `DEMO_OUT` | `Path("demo_out")` | Default root folder for all run artifacts, used when `--output-dir` is omitted |
 | `FALLBACK_JAVA_VERSION` | `"17"` | Used when pom.xml has no Java version property |
 | `DEFAULT_DOCKER_MAVEN_IMAGE` | env or `None` | Optional override for Docker image name |
 | `DEFAULT_DOCKER_MAVEN_CACHE_VOLUME` | env or `llm-coverage-maven-cache` | Named volume for Maven `.m2` cache |
+
+### `resolve_output_dir(output_dir) -> Path`
+
+Single source of truth for the tool's output root. Returns `Path(output_dir).expanduser().resolve()` when the `--output-dir` CLI flag is set, otherwise returns `DEMO_OUT` unchanged (relative `demo_out` next to the current working directory), preserving prior behavior for callers that don't pass the flag.
 
 ---
 
@@ -804,7 +808,8 @@ The main function. Detailed step-by-step:
 #### Step 1 — Setup (lines ~306–323)
 
 ```python
-run_root = DEMO_OUT / repo_name / "runs" / timestamp
+output_dir = resolve_output_dir(getattr(args, "output_dir", None))  # DEMO_OUT unless --output-dir is set
+run_root = output_dir / repo_name / "runs" / timestamp
 project_root = clone_or_update(args.repo, run_root / "repo", args.branch)
 demo_root = run_root / "DemoTestCases"
 ```

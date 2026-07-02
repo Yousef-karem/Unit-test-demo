@@ -24,6 +24,13 @@ def main() -> None:
         help="Re-run JaCoCo coverage for an existing run without regenerating tests "
         "(example: demo_out/09Ordenacao/runs/20260617_071517)",
     )
+    ap.add_argument(
+        "--output-dir",
+        default=None,
+        help="Root directory for generated artifacts (runs, coverage, summary.json, logs, ...). "
+        "Optional. If omitted, defaults to a 'demo_out' directory created relative to the "
+        "current working directory, preserving the tool's original behavior.",
+    )
     ap.add_argument("--branch", default=None)
     ap.add_argument("--mode", choices=["method", "class"], default="method", help="Generate tests per method or per class")
     ap.add_argument(

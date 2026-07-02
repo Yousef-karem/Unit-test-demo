@@ -27,6 +27,26 @@ MAX_STAGNATION_ITERATIONS = DEFAULT_MAX_STAGNATION_ITERATIONS
 
 DEMO_OUT = Path("demo_out")
 
+
+def resolve_output_dir(output_dir: str | None) -> Path:
+    """Resolve the root directory for generated artifacts (runs, coverage, summary.json, logs, ...).
+
+    This is the single source of truth for the tool's output location; every
+    module should derive its paths from this function's result instead of
+    referencing DEMO_OUT or a hardcoded "demo_out" directly.
+
+    If `output_dir` is falsy (the --output-dir CLI flag was omitted), this
+    returns DEMO_OUT unchanged, which preserves the tool's original behavior
+    exactly: a "demo_out" directory created relative to the current working
+    directory. This keeps existing callers (including the current VS Code
+    extension, which sets its cwd to the tool's directory) working with no
+    changes required.
+    """
+    if output_dir:
+        return Path(output_dir).expanduser().resolve()
+    return DEMO_OUT
+
+
 FALLBACK_JAVA_VERSION = "17"
 DEFAULT_DOCKER_MAVEN_IMAGE = os.getenv("DOCKER_MAVEN_IMAGE")
 DEFAULT_DOCKER_MAVEN_CACHE_VOLUME = os.getenv("DOCKER_MAVEN_CACHE_VOLUME", "llm-coverage-maven-cache")
