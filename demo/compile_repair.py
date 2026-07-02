@@ -112,6 +112,9 @@ def _errors_for_file(compile_errors: str, file_name: str) -> str:
     return "\n".join(matched) if matched else compile_errors
 
 
+_maven_verify_lock = threading.Lock()
+
+
 def _verify_file_compiles(
     project_root: Path,
     demo_root: Path,
@@ -121,12 +124,13 @@ def _verify_file_compiles(
     """Isolate other generated tests and run mvn test-compile for this file only."""
     from demo.pipeline import isolate_generated_tests_except
 
-    isolation_root = demo_root / "isolation" / "compile_repair_verify"
+    isolation_root = demo_root / "isolation" / "compile_repair_verify" / test_path.stem
     original = test_path.read_text(encoding="utf-8", errors="ignore") if test_path.exists() else ""
     test_path.write_text(code, encoding="utf-8")
     try:
-        with isolate_generated_tests_except(project_root, test_path, isolation_root):
-            compile_log, compile_rc = run_maven_test_compile(project_root)
+        with _maven_verify_lock:
+            with isolate_generated_tests_except(project_root, test_path, isolation_root):
+                compile_log, compile_rc = run_maven_test_compile(project_root)
         if compile_rc == 0:
             return True, compile_log
         return False, _errors_for_file(compile_log, test_path.name)
@@ -477,5 +481,16 @@ def run_parallel_compile_repair(
             for compile_failure in grouped
         }
         for fut in as_completed(futures):
-            results.append(fut.result())
+            compile_failure = futures[fut]
+            try:
+                results.append(fut.result())
+            except Exception as exc:
+                results.append(
+                    CompileRepairResult(
+                        failing_path=compile_failure.failing_path,
+                        action="rejected_repair_exception",
+                        errors_tail=str(exc),
+                        elapsed_seconds=0.0,
+                    )
+                )
     return results
