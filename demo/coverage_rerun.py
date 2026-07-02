@@ -41,10 +41,23 @@ def resolve_run_root(from_run: str) -> Path:
         run_root = (Path.cwd() / run_root).resolve()
     if not run_root.exists():
         raise FileNotFoundError(f"Run directory not found: {run_root}")
+
+    if run_root.name == "DemoTestCases" and run_root.is_dir():
+        return run_root.parent
+
     demo_root = run_root / "DemoTestCases"
-    if not demo_root.is_dir():
-        raise FileNotFoundError(f"Missing DemoTestCases/ under run directory: {run_root}")
-    return run_root
+    if demo_root.is_dir():
+        return run_root
+
+    if (run_root / "generated").is_dir() or (run_root / "config.json").is_file():
+        # Caller passed DemoTestCases/ but path name differs (symlink/custom layout).
+        return run_root.parent
+
+    raise FileNotFoundError(
+        f"Missing DemoTestCases/ under run directory: {run_root}. "
+        f"Pass the run folder (e.g. demo_out/26Grafo/runs/20260701_061104) "
+        f"or its DemoTestCases/ subfolder."
+    )
 
 
 def find_project_root(run_root: Path, demo_root: Path) -> Path:

@@ -203,6 +203,12 @@ def summarize_compile_errors(compile_log: str, file_name: str) -> str:
             "- STDOUT_HELPER: do not use `Console.in` to restore System.out; "
             "save `PrintStream originalOut = System.out` before setOut and restore in finally."
         )
+    for match in re.finditer(r"symbol:\s+class (\w+)", joined):
+        inner = match.group(1)
+        hints.append(
+            f"- NESTED_CLASS: `{inner}` is likely a nested type — use the qualified name "
+            f"(e.g. `Outer.{inner}`) or `Outer.{inner}` in declarations and `new Outer.{inner}(...)`."
+        )
     if not hints:
         return "\n".join(error_lines[-12:]) if error_lines else compile_log[-2000:]
     return "ERROR SUMMARY (follow these exactly):\n" + "\n".join(hints) + "\n\nRaw compiler lines:\n" + "\n".join(error_lines[-12:])
@@ -285,6 +291,70 @@ def fix_wrong_constructors(code: str, compile_log: str) -> str:
     return fixed
 
 
+def nested_class_map(source_text: str) -> Dict[str, str]:
+    """Map inner class simple names to Outer.Inner from production source."""
+    if not source_text:
+        return {}
+    outer_match = re.search(r"\bclass\s+(\w+)", source_text)
+    if not outer_match:
+        return {}
+    outer = outer_match.group(1)
+    nested: Dict[str, str] = {}
+    for match in re.finditer(r"\b(?:public\s+)?(?:static\s+)?class\s+(\w+)", source_text):
+        inner = match.group(1)
+        if inner != outer:
+            nested[inner] = f"{outer}.{inner}"
+    return nested
+
+
+def fix_nested_class_references(code: str, source_text: str) -> str:
+    """Qualify nested types (e.g. Aresta -> Grafo.Aresta) when used as bare symbols."""
+    nested = nested_class_map(source_text)
+    if not nested:
+        return code
+    fixed = code
+    for inner, qualified in nested.items():
+        fixed = re.sub(
+            rf"(?<!\.)\b{re.escape(inner)}\b",
+            qualified,
+            fixed,
+        )
+    return fixed
+
+
+def _zero_arg_public_methods(source_text: str) -> List[str]:
+    if not source_text:
+        return []
+    return re.findall(r"\bpublic\s+(?:[\w.<>\[\]]+\s+)+(\w+)\s*\(\s*\)\s*\{", source_text)
+
+
+def fix_invented_getter_names(code: str, source_text: str) -> str:
+    """Map invented JavaBean getters to real zero-arg methods from source (e.g. getPeso -> peso)."""
+    methods = _zero_arg_public_methods(source_text)
+    if not methods:
+        return code
+    fixed = code
+    for method in methods:
+        for prefix in ("get", "is"):
+            if not method:
+                continue
+            invented = prefix + method[0].upper() + method[1:]
+            fixed = fixed.replace(f".{invented}(", f".{method}(")
+    # Common LLM shorthand for edge destination vertex in graph tests.
+    if ".getV(" in fixed and "v2" in methods:
+        fixed = fixed.replace(".getV(", ".v2(")
+    return fixed
+
+
+def fix_field_access_as_methods(code: str, source_text: str) -> str:
+    """Rewrite private field reads to accessor calls when a matching public method exists."""
+    methods = set(_zero_arg_public_methods(source_text))
+    fixed = code
+    for name in sorted(methods, key=len, reverse=True):
+        fixed = re.sub(rf"\.{re.escape(name)}\b(?!\s*\()", f".{name}()", fixed)
+    return fixed
+
+
 def fix_stdout_capture_helper(code: str) -> str:
     if "Console.in" not in code and "java.io.Console.in" not in code:
         return code
@@ -322,6 +392,9 @@ def apply_shell_compile_fixes(code: str, compile_log: str, source_text: str = ""
     fixed = fix_wrong_constructors(fixed, compile_log)
     fixed = fix_wrong_constructors_from_source(fixed, source_text)
     if source_text:
+        fixed = fix_nested_class_references(fixed, source_text)
+        fixed = fix_invented_getter_names(fixed, source_text)
+        fixed = fix_field_access_as_methods(fixed, source_text)
         fixed = fix_method_name_typos(fixed, source_text)
     fixed = fix_stdout_capture_helper(fixed)
     fixed = add_throws_exception_to_test_methods(fixed, compile_log)
