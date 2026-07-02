@@ -1,0 +1,121 @@
+{
+  "name": "unit-test-generator",
+  "displayName": "Unit Test Generator",
+  "description": "Generate Java unit tests for the current project using the llm_coverage_demo.py tool.",
+  "version": "0.1.0",
+  "publisher": "unit-test-generator",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "unitTestGenerator.generateTests",
+        "title": "Unit Test Generator: Generate Tests",
+        "category": "Unit Test Generator"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "unitTestGenerator.generateTests"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "unitTestGenerator.generateTests",
+          "when": "resourceLangId == java || explorerResourceIsFolder",
+          "group": "unitTestGenerator@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "unitTestGenerator.generateTests",
+          "when": "resourceLangId == java",
+          "group": "unitTestGenerator@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Unit Test Generator",
+      "properties": {
+        "unitTestGenerator.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to run the unit test generation tool."
+        },
+        "unitTestGenerator.scriptPath": {
+          "type": "string",
+          "default": "llm_coverage_demo.py",
+          "description": "Path to llm_coverage_demo.py. The Python tool lives outside the Java project, so this is never resolved against the target workspace: use an absolute path, or a relative path combined with 'Tool Directory' below."
+        },
+        "unitTestGenerator.toolDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Directory containing the unit test generation tool (llm_coverage_demo.py). Used to resolve 'Script Path' when it is relative. Leave empty if 'Script Path' is already absolute. The tool is also launched with this directory as its working directory, so 'demo_out' is written here."
+        },
+        "unitTestGenerator.mode": {
+          "type": "string",
+          "enum": [
+            "class",
+            "method"
+          ],
+          "default": "method",
+          "description": "Generation mode: generate tests per class or per method."
+        },
+        "unitTestGenerator.analysisMode": {
+          "type": "string",
+          "enum": [
+            "ast",
+            "source"
+          ],
+          "default": "ast",
+          "description": "Analysis strategy used to discover generation targets."
+        },
+        "unitTestGenerator.classPromptSlices": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 4,
+          "description": "Number of focused prompt slices per class (only applies when mode is 'class')."
+        },
+        "unitTestGenerator.maxTargets": {
+          "type": "number",
+          "default": 150,
+          "description": "Maximum number of generation targets (safety limit)."
+        },
+        "unitTestGenerator.maxRefinementIterations": {
+          "type": "number",
+          "default": 5,
+          "description": "Maximum LLM repair attempts per generated test during refinement."
+        },
+        "unitTestGenerator.ollamaModel": {
+          "type": "string",
+          "default": "",
+          "description": "Ollama model name to use (leave empty to use the tool's default)."
+        },
+        "unitTestGenerator.openaiModel": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI/GPT model name to use (leave empty to use the tool's default)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

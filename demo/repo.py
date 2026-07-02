@@ -87,7 +87,30 @@ def _resolve_project_root(dest: Path, subpath: Optional[str]) -> Path:
     return project
 
 
-def clone_or_update(repo: str, dest_repo: Path, branch: Optional[str]) -> Path:
+def _ignore_path(excluded: Path):
+    """Build a shutil.copytree `ignore` callback that skips one resolved path.
+
+    Used to keep the tool's own output directory out of the working copy it
+    makes of a local project, even when that output directory has been
+    configured to live inside the project tree (e.g. `<repo>/demo_out`).
+    Without this, copying the project would also copy the output directory
+    into itself, and every subsequent run would re-copy the ever-growing
+    result, producing repeatedly nested `demo_out` folders.
+    """
+
+    def _ignore(src: str, names: list[str]) -> set[str]:
+        src_path = Path(src)
+        return {name for name in names if (src_path / name).resolve() == excluded}
+
+    return _ignore
+
+
+def clone_or_update(
+    repo: str,
+    dest_repo: Path,
+    branch: Optional[str],
+    output_dir: Optional[Path] = None,
+) -> Path:
     subpath: Optional[str] = None
     clone_url = repo
 
@@ -102,7 +125,8 @@ def clone_or_update(repo: str, dest_repo: Path, branch: Optional[str]) -> Path:
             raise RuntimeError(f"Local path not found: {p}")
         if dest_repo.exists():
             shutil.rmtree(dest_repo)
-        shutil.copytree(p, dest_repo)
+        ignore = _ignore_path(output_dir.resolve()) if output_dir is not None else None
+        shutil.copytree(p, dest_repo, ignore=ignore)
         return dest_repo
 
     dest = dest_repo

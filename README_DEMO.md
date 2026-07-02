@@ -424,6 +424,7 @@ You typically run the tool like this:
 ```bash
 python llm_coverage_demo.py \
   --repo "https://github.com/Yousef-karem/Sagely_Backend_Java.git" \
+  --output-dir "<repo>/demo_out" \
   --mode class \
   --build auto \
   --gpt-model "gpt-5.2" \
@@ -447,7 +448,39 @@ Below is what **each option/flag does**, and how it affects generation + coverag
 
 **What happens:**
 The tool clones/copies the repo into:
-`demo_out/<repo_name>/runs/<timestamp>/repo/`
+`<output_dir>/<repo_name>/runs/<timestamp>/repo/`
+(see `--output-dir` below for what `<output_dir>` resolves to)
+
+---
+
+### `--output-dir`
+
+**What it does:** Sets the root directory where all generated artifacts are written — `runs/`, `coverage/`, `summary.json`, `logs/`, and everything else nested under a run.
+
+**Optional:** yes.
+
+**Default when omitted:** a `demo_out` directory created relative to the current working directory (the tool's original behavior, unchanged for existing scripts/CI that don't pass this flag).
+
+**Example:**
+
+```bash
+--repo "C:\Projects\Calculator" \
+--output-dir "C:\Projects\Calculator\demo_out"
+```
+
+This writes output next to the target project instead of next to the Python tool:
+
+```
+Calculator/
+├── src/
+├── pom.xml
+├── demo_out/
+│   ├── runs/
+│   ├── coverage/
+│   ├── summary.json
+│   └── logs/
+└── ...
+```
 
 ---
 

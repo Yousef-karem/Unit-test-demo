@@ -36,6 +36,7 @@ from demo.config import (
     DEMO_OUT,
     GENERATED_PATTERN,
     GENERATED_PREFIX,
+    resolve_output_dir,
 )
 from demo.coverage.maven import (
     extract_failing_test_paths,
@@ -709,8 +710,8 @@ def base_commit_from_analysis(path: Path) -> str | None:
     return str(commit) if commit else None
 
 
-def latest_previous_analysis_base(repo_name: str, current_run_root: Path) -> Path | None:
-    runs_root = DEMO_OUT / repo_name / "runs"
+def latest_previous_analysis_base(repo_name: str, current_run_root: Path, output_dir: Path) -> Path | None:
+    runs_root = output_dir / repo_name / "runs"
     if not runs_root.is_dir():
         return None
     candidates: List[Path] = []
@@ -736,11 +737,11 @@ def latest_previous_analysis_base(repo_name: str, current_run_root: Path) -> Pat
     return candidates[0]
 
 
-def resolve_incremental_base_analysis(args, repo_name: str, run_root: Path) -> Path:
+def resolve_incremental_base_analysis(args, repo_name: str, run_root: Path, output_dir: Path) -> Path:
     explicit = getattr(args, "analysis_base", None)
     if explicit:
         return Path(explicit)
-    detected = latest_previous_analysis_base(repo_name, run_root)
+    detected = latest_previous_analysis_base(repo_name, run_root, output_dir)
     if detected is None:
         raise RuntimeError(
             "--analysis-incremental needs a base analysis. Pass --analysis-base, "
@@ -980,12 +981,13 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     timing: Dict[str, float] = {}
 
     # 1) Per-repo run root + clone/open repo
-    DEMO_OUT.mkdir(exist_ok=True)
+    output_dir = resolve_output_dir(getattr(args, "output_dir", None))
+    output_dir.mkdir(parents=True, exist_ok=True)
     repo_name = repo_name_from_arg(args.repo)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_root = DEMO_OUT / repo_name / "runs" / timestamp
+    run_root = output_dir / repo_name / "runs" / timestamp
     run_root.mkdir(parents=True, exist_ok=True)
-    project_root = clone_or_update(args.repo, run_root / "repo", args.branch)
+    project_root = clone_or_update(args.repo, run_root / "repo", args.branch, output_dir)
     if patch_obsolete_tools_jar_dependency(project_root):
         print("Patched obsolete com.sun:tools/tools.jar dependency for modern JDK compatibility.")
 
@@ -1103,7 +1105,7 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
             else demo_root / f"{repo_name}-shards"
         )
         if analysis_incremental:
-            base_analysis_path = resolve_incremental_base_analysis(args, repo_name, run_root)
+            base_analysis_path = resolve_incremental_base_analysis(args, repo_name, run_root, output_dir)
             resolved_analysis_base = str(base_analysis_path)
             changed_files_arg = getattr(args, "analysis_changed_files", None)
             deleted_files_arg = getattr(args, "analysis_deleted_files", None)
