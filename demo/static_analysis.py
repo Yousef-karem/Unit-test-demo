@@ -5,8 +5,63 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
+# ---------------------------------------------------------------------------
+# Javadoc data structures
+# ---------------------------------------------------------------------------
+@dataclass
+class JavadocParamInfo:
+    """Documents a single ``@param`` tag."""
+
+    name: str
+    description: str
+
+
+@dataclass
+class JavadocThrowsInfo:
+    """Documents a single ``@throws`` / ``@exception`` tag."""
+
+    exception_type: str
+    description: str
+
+
+@dataclass
+class JavadocInfo:
+    """Structured Javadoc extracted from a class-level declaration."""
+
+    summary: str = ""
+    description: str = ""
+    author: List[str] = field(default_factory=list)
+    version: str = ""
+    since: str = ""
+    deprecated: str = ""
+    see: List[str] = field(default_factory=list)
+
+
+@dataclass
+class JavadocMethodInfo:
+    """Structured Javadoc extracted from a method or constructor declaration."""
+
+    summary: str = ""
+    description: str = ""
+    params: List[JavadocParamInfo] = field(default_factory=list)
+    returns: str = ""
+    throws: List[JavadocThrowsInfo] = field(default_factory=list)
+    deprecated: str = ""
+    see: List[str] = field(default_factory=list)
+    links: List[str] = field(default_factory=list)
+
+
+@dataclass
+class JavadocFieldInfo:
+    """Structured Javadoc extracted from a field declaration."""
+
+    summary: str = ""
+    description: str = ""
+    deprecated: str = ""
+#================================end num1===================================
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ANALYZER_JAR = REPO_ROOT / "testnexus-analyzer-1.0.0.jar"
@@ -358,44 +413,316 @@ def target_from_method(
     }
 
 
+# ---------------------------------------------------------------------------
+# Javadoc extraction helpers
+# ---------------------------------------------------------------------------
+
+def _tag_text(tag: Dict) -> str:
+    """Return the plain-text content of a single Javadoc tag dict."""
+    # JavaParser serialises tag content as either a plain string or a list of
+    # inline elements, each of which may carry a ``text`` field.
+    content = tag.get("content") or tag.get("description") or tag.get("text") or ""
+    if isinstance(content, list):
+        return " ".join(
+            (part.get("text") or part.get("content") or "") if isinstance(part, dict) else str(part)
+            for part in content
+        ).strip()
+    return str(content).strip()
+
+
+def _collect_tags(javadoc: Dict, *tag_names: str) -> List[Dict]:
+    """Return all tag dicts whose ``name`` field matches any of *tag_names*."""
+    tags = javadoc.get("tags") or []
+    lower_names = {n.lower().lstrip("@") for n in tag_names}
+    return [t for t in tags if (t.get("tagName") or t.get("name") or "").lower().lstrip("@") in lower_names]
+
+
+def _first_tag_text(javadoc: Dict, *tag_names: str) -> str:
+    """Return the text of the first matching tag, or an empty string."""
+    matches = _collect_tags(javadoc, *tag_names)
+    return _tag_text(matches[0]) if matches else ""
+
+
+def _inline_links(javadoc: Dict) -> List[str]:
+    """Extract {@link …} targets from the comment body."""
+    body = javadoc.get("description") or javadoc.get("comment") or ""
+    if isinstance(body, list):
+        # Inline element list
+        links: List[str] = []
+        for part in body:
+            if isinstance(part, dict) and part.get("type") in ("INLINE_TAG", "link"):
+                ref = part.get("reference") or part.get("text") or ""
+                if ref:
+                    links.append(ref)
+        return links
+    # Plain-string body – mine {@link …} with regex as a fallback
+    return re.findall(r"\{@link\s+([^}]+)\}", str(body))
+
+def _javadoc_summary_and_description(javadoc: Dict) -> Tuple[str, str]:
+    """Return (summary, full_description) from a Javadoc dict.
+
+    JavaParser may expose the first sentence as ``firstSentence`` / ``summary``
+    and the remainder as ``description`` or ``comment``.  We normalise both
+    representations into a consistent (summary, description) pair.
+    """
+    # Prefer a dedicated summary / firstSentence field when present.
+    summary_raw = (
+        javadoc.get("firstSentence")
+        or javadoc.get("summary")
+        or ""
+    )
+    if isinstance(summary_raw, list):
+        summary = " ".join(
+            (p.get("text") or "") if isinstance(p, dict) else str(p) for p in summary_raw
+        ).strip()
+    else:
+        summary = str(summary_raw).strip()
+
+    desc_raw = javadoc.get("description") or javadoc.get("comment") or ""
+    if isinstance(desc_raw, list):
+        description = " ".join(
+            (p.get("text") or "") if isinstance(p, dict) else str(p) for p in desc_raw
+        ).strip()
+    else:
+        description = str(desc_raw).strip()
+
+    # If there was no dedicated summary field, derive it from the description.
+    if not summary and description:
+        summary = description.split(".")[0].strip()
+
+    # Remove the summary sentence from the description to avoid duplication.
+    if summary and description.startswith(summary):
+        description = description[len(summary):].lstrip(". \t").strip()
+
+    return summary, description
+
+def extract_class_javadoc(class_info: Dict) -> Optional[JavadocInfo]:
+    """Extract class-level Javadoc from *class_info*, or return ``None``."""
+    javadoc = class_info.get("javadoc")
+    if not javadoc or not isinstance(javadoc, dict):
+        return None
+
+    summary, description = _javadoc_summary_and_description(javadoc)
+    authors = [_tag_text(t) for t in _collect_tags(javadoc, "author")]
+    see_refs = [_tag_text(t) for t in _collect_tags(javadoc, "see")]
+
+    return JavadocInfo(
+        summary=summary,
+        description=description,
+        author=authors,
+        version=_first_tag_text(javadoc, "version"),
+        since=_first_tag_text(javadoc, "since"),
+        deprecated=_first_tag_text(javadoc, "deprecated"),
+        see=see_refs,
+    )
+
+
+def extract_method_javadoc(method_info: Dict) -> Optional[JavadocMethodInfo]:
+    """Extract method-level Javadoc from *method_info*, or return ``None``."""
+    javadoc = method_info.get("javadoc")
+    if not javadoc or not isinstance(javadoc, dict):
+        return None
+
+    summary, description = _javadoc_summary_and_description(javadoc)
+
+    params: List[JavadocParamInfo] = []
+    for tag in _collect_tags(javadoc, "param"):
+        param_name = tag.get("parameterName") or tag.get("name") or ""
+        # For @param the tag text often excludes the parameter name itself.
+        param_desc = tag.get("description") or _tag_text(tag)
+        params.append(JavadocParamInfo(name=param_name, description=param_desc))
+
+    throws: List[JavadocThrowsInfo] = []
+    for tag in _collect_tags(javadoc, "throws", "exception"):
+        exc_type = tag.get("exceptionName") or tag.get("type") or ""
+        exc_desc = tag.get("description") or _tag_text(tag)
+        throws.append(JavadocThrowsInfo(exception_type=exc_type, description=exc_desc))
+
+    see_refs = [_tag_text(t) for t in _collect_tags(javadoc, "see")]
+    links = _inline_links(javadoc)
+
+    returns_tag = _collect_tags(javadoc, "return", "returns")
+    returns = _tag_text(returns_tag[0]) if returns_tag else ""
+
+    return JavadocMethodInfo(
+        summary=summary,
+        description=description,
+        params=params,
+        returns=returns,
+        throws=throws,
+        deprecated=_first_tag_text(javadoc, "deprecated"),
+        see=see_refs,
+        links=links,
+    )
+
+
+def extract_constructor_javadoc(ctor_info: Dict) -> Optional[JavadocMethodInfo]:
+    """Extract constructor Javadoc from *ctor_info*, or return ``None``.
+
+    Constructor Javadoc is a subset of method Javadoc (no ``@return`` tag).
+    """
+    javadoc = ctor_info.get("javadoc")
+    if not javadoc or not isinstance(javadoc, dict):
+        return None
+
+    summary, description = _javadoc_summary_and_description(javadoc)
+
+    params: List[JavadocParamInfo] = []
+    for tag in _collect_tags(javadoc, "param"):
+        param_name = tag.get("parameterName") or tag.get("name") or ""
+        param_desc = tag.get("description") or _tag_text(tag)
+        params.append(JavadocParamInfo(name=param_name, description=param_desc))
+
+    throws: List[JavadocThrowsInfo] = []
+    for tag in _collect_tags(javadoc, "throws", "exception"):
+        exc_type = tag.get("exceptionName") or tag.get("type") or ""
+        exc_desc = tag.get("description") or _tag_text(tag)
+        throws.append(JavadocThrowsInfo(exception_type=exc_type, description=exc_desc))
+
+    return JavadocMethodInfo(
+        summary=summary,
+        description=description,
+        params=params,
+        returns="",
+        throws=throws,
+        deprecated=_first_tag_text(javadoc, "deprecated"),
+        see=[],
+        links=[],
+    )
+
+
+def extract_field_javadoc(field_info: Dict) -> Optional[JavadocFieldInfo]:
+    """Extract field-level Javadoc from *field_info*, or return ``None``."""
+    javadoc = field_info.get("javadoc")
+    if not javadoc or not isinstance(javadoc, dict):
+        return None
+
+    summary, description = _javadoc_summary_and_description(javadoc)
+    return JavadocFieldInfo(
+        summary=summary,
+        description=description,
+        deprecated=_first_tag_text(javadoc, "deprecated"),
+    )
+
+# ---------------------------------------------------------------------------
+# Javadoc rendering helpers
+# ---------------------------------------------------------------------------
+
+
+def _render_javadoc_info(lines: List[str], jdoc: JavadocInfo) -> None:
+    """Append a human-readable rendering of *jdoc* to *lines*."""
+    if jdoc.summary:
+        lines.append(f"  doc: {jdoc.summary}")
+    if jdoc.description:
+        lines.append(f"  description: {jdoc.description}")
+    if jdoc.deprecated:
+        lines.append(f"  @deprecated: {jdoc.deprecated}")
+    if jdoc.author:
+        lines.append(f"  @author: {', '.join(jdoc.author)}")
+    if jdoc.version:
+        lines.append(f"  @version: {jdoc.version}")
+    if jdoc.since:
+        lines.append(f"  @since: {jdoc.since}")
+    if jdoc.see:
+        lines.append(f"  @see: {', '.join(jdoc.see)}")
+
+
+def _render_method_javadoc(lines: List[str], jdoc: JavadocMethodInfo, indent: str = "  ") -> None:
+    """Append a human-readable rendering of *jdoc* to *lines*."""
+    if jdoc.summary:
+        lines.append(f"{indent}doc: {jdoc.summary}")
+    if jdoc.description:
+        lines.append(f"{indent}description: {jdoc.description}")
+    if jdoc.deprecated:
+        lines.append(f"{indent}@deprecated: {jdoc.deprecated}")
+    for param in jdoc.params:
+        if param.name or param.description:
+            lines.append(f"{indent}@param {param.name}: {param.description}".rstrip(": "))
+    if jdoc.returns:
+        lines.append(f"{indent}@return: {jdoc.returns}")
+    for throws in jdoc.throws:
+        exc = throws.exception_type or "Exception"
+        lines.append(f"{indent}@throws {exc}: {throws.description}".rstrip(": "))
+    if jdoc.see:
+        lines.append(f"{indent}@see: {', '.join(jdoc.see)}")
+    if jdoc.links:
+        lines.append(f"{indent}links: {', '.join(jdoc.links)}")
+
+# ---------------------------------------------------------------------------
+# edit the class_ast_summary
+# ---------------------------------------------------------------------------
+
+
 def class_ast_summary(fqcn: str, class_info: Dict) -> str:
     lines = [
         "STATIC ANALYSIS SUMMARY (not raw source)",
         f"class: {fqcn}",
         f"kind: {class_info.get('kind', 'class')}",
     ]
-    if class_info.get("domainKind"):
-        lines.append(f"domainKind: {class_info['domainKind']}")
-    if class_info.get("annotations"):
-        lines.append(f"annotations: {', '.join(class_info['annotations'])}")
-    if class_info.get("extendsClass"):
-        lines.append(f"extends: {class_info['extendsClass']}")
-    if class_info.get("implementsList"):
-        lines.append(f"implements: {', '.join(class_info['implementsList'])}")
+
+    class_jdoc = extract_class_javadoc(class_info)
+    if class_jdoc:
+        lines.append("javadoc:")
+        _render_javadoc_info(lines, class_jdoc)
+    else:
+        if class_info.get("domainKind"):
+            lines.append(f"domainKind: {class_info['domainKind']}")
+        if class_info.get("annotations"):
+            lines.append(f"annotations: {', '.join(class_info['annotations'])}")
+        if class_info.get("extendsClass"):
+            lines.append(f"extends: {class_info['extendsClass']}")
+        if class_info.get("implementsList"):
+            lines.append(f"implements: {', '.join(class_info['implementsList'])}")
+
     if class_info.get("autowiredComponents"):
         lines.append("autowiredComponents:")
         lines.extend(f"- {item}" for item in class_info["autowiredComponents"][:20])
+
     fields = class_info.get("fields") or []
     if fields:
         lines.append("fields:")
-        for field in fields[:30]:
-            mods = " ".join(field.get("modifiers") or [])
-            field_type = field.get("resolvedType") or field.get("type") or "Object"
-            anns = field.get("annotations") or []
-            ann_text = f" @{','.join(anns)}" if anns else ""
-            lines.append(f"- {mods} {field_type} {field.get('name', '')}{ann_text}".strip())
+        for fld in fields[:30]:
+            field_jdoc = extract_field_javadoc(fld)
+            if field_jdoc:
+                field_type = fld.get("resolvedType") or fld.get("type") or "Object"
+                lines.append(f"- {fld.get('name', '')} ({field_type})")
+                if field_jdoc.summary:
+                    lines.append(f"  doc: {field_jdoc.summary}")
+                if field_jdoc.description:
+                    lines.append(f"  description: {field_jdoc.description}")
+                if field_jdoc.deprecated:
+                    lines.append(f"  @deprecated: {field_jdoc.deprecated}")
+            else:
+                mods = " ".join(fld.get("modifiers") or [])
+                field_type = fld.get("resolvedType") or fld.get("type") or "Object"
+                anns = fld.get("annotations") or []
+                ann_text = f" @{','.join(anns)}" if anns else ""
+                lines.append(f"- {mods} {field_type} {fld.get('name', '')}{ann_text}".strip())
+
     constructors = class_info.get("constructors") or []
     if constructors:
         lines.append("constructors:")
         for ctor in constructors[:12]:
             lines.append(f"- {ctor.get('signature', 'constructor')}")
-            snippet = (ctor.get("sourceSnippet") or "").strip()
-            if snippet:
-                lines.append(f"  snippet: {snippet[:240]}")
+            ctor_jdoc = extract_constructor_javadoc(ctor)
+            if ctor_jdoc:
+                _render_method_javadoc(lines, ctor_jdoc, indent="  ")
+            else:
+                snippet = (ctor.get("sourceSnippet") or "").strip()
+                if snippet:
+                    lines.append(f"  snippet: {snippet[:240]}")
+
     lines.append("methods:")
     for sig, method in (class_info.get("methods") or {}).items():
-        lines.append(f"- {method.get('returnType', 'void')} {sig}")
+        method_jdoc = extract_method_javadoc(method)
+        if method_jdoc:
+            lines.append(f"- {sig}")
+            _render_method_javadoc(lines, method_jdoc, indent="  ")
+        else:
+            lines.append(f"- {method.get('returnType', 'void')} {sig}")
+
     return "\n".join(lines)
+
 
 
 def method_ast_summary(fqcn: str, signature: str, method_info: Dict) -> str:

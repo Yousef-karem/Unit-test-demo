@@ -171,12 +171,27 @@ def ollama_write_prompt(model: str, target: Dict, project_types_text: str, java_
     )
 
     class_mode_note = ""
+    class_snippet_guidance = ""
     if target.get("method_name") is None:
         class_mode_note = (
             "If this is a framework wiring/config/filter class (e.g., Security filter, config), "
             "produce minimal unit tests focusing only on pure methods; do not reference servlet API types "
             "unless they appear in imports/snippet."
         )
+        class_snippet_guidance = (
+            "Class-mode source snippet is a Javadoc-aware static analysis summary (not raw Java source). "
+            "It always includes structural class metadata (domainKind, annotations, extends, implements). "
+            "When Javadoc is available for a member, prefer doc:, description:, @param, @return, @throws, "
+            "and @deprecated lines as the primary description of behavior. "
+            "Fields always show modifiers, type, and annotations; doc: lines are appended when Javadoc exists. "
+            "Methods with Javadoc list only the signature (return type appears in @return); "
+            "methods without Javadoc list return type and signature. "
+            "Constructors with Javadoc omit source snippets; undocumented constructors include snippet: lines. "
+            "A single class may mix Javadoc-documented and AST-only members—honor each member's format. "
+            "Base tests on documented contracts and APIs visible in the snippet or allowlist; do not invent methods or types."
+        )
+
+    snippet_context_block = f"\n{class_snippet_guidance}\n" if class_snippet_guidance else ""
 
     sys = (
         "You are a senior Java testing expert. "
@@ -235,7 +250,7 @@ Target:
 
 Package/imports context:
 {imports_context}
-
+{snippet_context_block}
 Source snippet:
 {target["snippet"]}
 

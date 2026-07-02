@@ -17,6 +17,9 @@ from typing import Dict, Iterator, List, Optional, Set
 
 
 
+from demo.class_mode.expansion import expand_class_targets
+from demo.class_mode.naming import apply_slice_test_class_name
+from demo.class_mode.validation import validate_slice_test_coverage
 from demo.config import (
     DEFAULT_COVERAGE_THRESHOLD,
     DEFAULT_DOCKER_MAVEN_CACHE_VOLUME,
@@ -849,6 +852,8 @@ def _generate_one_target(
         )
 
         test_class = ensure_unique_test_class_name(generated.test_class_name, t, args.mode)
+        if t.get("class_prompt_slice"):
+            test_class = apply_slice_test_class_name(t, test_class)
         with name_lock:
             test_class = ensure_unique_run_class_name(test_class, used_test_class_names, index)
             used_test_class_names.add(test_class)
@@ -889,6 +894,7 @@ def _generate_one_target(
             invalid_reason = (
                 validate_java_test_output(code, test_class)
                 or validate_junit_framework(code, junit_version)
+                or validate_slice_test_coverage(code, t)
                 or validate_test_coverage_quality(code, t, related_sources)
                 or ""
             )
@@ -1190,6 +1196,15 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
             "mockito": has_mockito,
         }
 
+    if (
+        args.mode == "class"
+        and getattr(args, "class_prompt_slices", 1) > 1
+        and analysis_mode == "ast"
+    ):
+        targets = expand_class_targets(targets, slices=args.class_prompt_slices)
+        if len(targets) > args.max_targets:
+            targets = targets[: args.max_targets]
+
     # Save config and target list for reproducibility
     config = {
         "args": vars(args),
@@ -1308,6 +1323,9 @@ def run_pipeline(args, prompt_generator: PromptGenerator | None = None) -> None:
     (demo_root / "generation_quality_log.json").write_text(
         json.dumps(generation_quality_log, indent=2), encoding="utf-8"
     )
+    
+    # Create isolation directory before writing any files into it.
+    (demo_root / "isolation").mkdir(parents=True, exist_ok=True)
 
     (demo_root / "isolation").mkdir(parents=True, exist_ok=True)
 
